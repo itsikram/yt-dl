@@ -8,6 +8,8 @@ import tempfile
 import subprocess
 from typing import Tuple
 import logging
+import base64
+import logging
 import urllib.parse
 import uuid
 import asyncio
@@ -48,6 +50,9 @@ app.mount("/files", StaticFiles(directory=DOWNLOAD_DIR), name="files")
 FFMPEG_EXE = os.getenv("FFMPEG_EXE")
 # In-memory progress store keyed by a client/job-provided progress_id
 JOB_PROGRESS: dict[str, dict] = {}
+
+# Optional cookies file to pass to yt-dlp (Netscape format), populated from env
+COOKIES_FILE: str | None = None
 
 
 def _make_progress_hook(progress_id: str):
@@ -160,7 +165,7 @@ def _progress_printer(d: dict) -> None:
         print(f"\n[download] Completed: {filename}")
 
 
-def _download_video_to_tmp(url: str, progress_id: str | None = None) -> Tuple[str, str, str]:
+def _download_video_to_tmp(url: str, progress_id: str | None = None, cookies_file: str | None = None) -> Tuple[str, str, str]:
     """
     Download a YouTube video to a temporary directory and return
     (temp_dir, file_path, download_title).
@@ -188,6 +193,8 @@ def _download_video_to_tmp(url: str, progress_id: str | None = None) -> Tuple[st
             # Prioritize H.264/AAC for broad compatibility
             "format": "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/best[ext=mp4]/best",
         }
+        if cookies_file:
+            ydl_opts["cookiefile"] = cookies_file
         if _has_ffmpeg():
             # Point yt-dlp to the bundled/system ffmpeg executable
             ydl_opts["ffmpeg_location"] = FFMPEG_EXE
@@ -206,6 +213,8 @@ def _download_video_to_tmp(url: str, progress_id: str | None = None) -> Tuple[st
             # Prefer MP4; fall back to any progressive format with audio
             "format": "best[acodec!=none][vcodec!=none][ext=mp4]/best[acodec!=none][vcodec!=none]",
         }
+        if cookies_file:
+            ydl_opts["cookiefile"] = cookies_file
         if progress_id:
             ydl_opts["progress_hooks"] = [_make_progress_hook(progress_id)]
         else:
@@ -377,6 +386,7 @@ def download(
     disposition: str = Query("attachment", description="inline or attachment"),
     link_only: bool = Query(True, description="Return JSON with a hosted file link instead of file data"),
     progress_id: str | None = Query(None, description="Client-provided id to poll progress at /progress/{id}"),
+    cookies_b64: str | None = Query(None, description="Optional base64-encoded Netscape cookies.txt for yt-dlp"),
     background_tasks: BackgroundTasks = None,
 ):
     # Ensure a progress id for clients that want to poll
@@ -393,7 +403,27 @@ def download(
         # Avoid breaking the request due to logging issues
         pass
 
-    temp_dir, file_path, title = _download_video_to_tmp(url, progress_id)
+    # Prepare optional cookies file
+    cookies_path: str | None = None
+    if cookies_b64:
+        try:
+            decoded = base64.b64decode(cookies_b64)
+            import tempfile as _tf
+            cookies_tmp = _tf.NamedTemporaryFile(prefix="ytvdl_req_cookies_", suffix=".txt", delete=False)
+            with cookies_tmp as f:
+                f.write(decoded)
+            cookies_path = cookies_tmp.name
+            logger.info("/download: using cookies from request param")
+            if background_tasks is not None:
+                background_tasks.add_task(_delete_path_safely, cookies_path)
+        except Exception:
+            logger.exception("/download: failed decoding/writing cookies_b64 param")
+            raise HTTPException(status_code=400, detail="Invalid cookies_b64 parameter")
+    elif COOKIES_FILE:
+        cookies_path = COOKIES_FILE
+        logger.info("/download: using cookies from env file")
+
+    temp_dir, file_path, title = _download_video_to_tmp(url, progress_id, cookies_path)
 
     # Schedule cleanup after response is sent
     if background_tasks is not None:
@@ -481,6 +511,20 @@ async def _startup_cleanup_task() -> None:
         available = _has_ffmpeg()
         logger.info("Startup: DOWNLOAD_DIR=%s", DOWNLOAD_DIR)
         logger.info("Startup: FFMPEG_EXE=%s available=%s", FFMPEG_EXE, available)
+        # Load cookies from env if provided (base64 Netscape cookies.txt)
+        global COOKIES_FILE
+        cookies_b64 = os.getenv("YTDLP_COOKIES_B64")
+        if cookies_b64 and not COOKIES_FILE:
+            try:
+                decoded = base64.b64decode(cookies_b64)
+                import tempfile as _tf
+                cookies_tmp = _tf.NamedTemporaryFile(prefix="ytvdl_cookies_", suffix=".txt", delete=False)
+                with cookies_tmp as f:
+                    f.write(decoded)
+                COOKIES_FILE = cookies_tmp.name
+                logger.info("Startup: Loaded cookies file from env into %s", COOKIES_FILE)
+            except Exception:
+                logger.exception("Startup: Failed to decode/write YTDLP_COOKIES_B64")
     except Exception:
         logger.exception("Startup: failed to resolve ffmpeg or log env")
     # Kick off background cleanup loop
