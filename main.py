@@ -165,7 +165,13 @@ def _progress_printer(d: dict) -> None:
         print(f"\n[download] Completed: {filename}")
 
 
-def _download_video_to_tmp(url: str, progress_id: str | None = None, cookies_file: str | None = None) -> Tuple[str, str, str]:
+def _download_video_to_tmp(
+    url: str,
+    progress_id: str | None = None,
+    cookies_file: str | None = None,
+    target_height: int | None = None,
+    fast: bool = True,
+) -> Tuple[str, str, str]:
     """
     Download a YouTube video to a temporary directory and return
     (temp_dir, file_path, download_title).
@@ -177,7 +183,7 @@ def _download_video_to_tmp(url: str, progress_id: str | None = None, cookies_fil
 
     ffmpeg_available = _has_ffmpeg()
 
-    # Prefer MP4 output. With FFmpeg we can merge/convert; without, we try progressive MP4.
+    # Prefer MP4 output. With FFmpeg we can merge/convert; without, try progressive MP4.
     if ffmpeg_available:
         ydl_opts = {
             "outtmpl": os.path.join(temp_dir, "%(title)s.%(ext)s"),
@@ -190,8 +196,12 @@ def _download_video_to_tmp(url: str, progress_id: str | None = None, cookies_fil
             "postprocessors": [
                 {"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"},
             ],
-            # Prioritize H.264/AAC for broad compatibility
-            "format": "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+            # Prioritize H.264/AAC; if a height is requested, try to cap at that height to avoid transcoding
+            "format": (
+                f"bestvideo[ext=mp4][vcodec^=avc1][height<={target_height}]+bestaudio[ext=m4a]/"
+                f"best[ext=mp4][height<={target_height}]/best[height<={target_height}]/"
+                "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+            ) if target_height else "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/best[ext=mp4]/best",
         }
         if cookies_file:
             ydl_opts["cookiefile"] = cookies_file
@@ -211,7 +221,11 @@ def _download_video_to_tmp(url: str, progress_id: str | None = None, cookies_fil
             "restrictfilenames": True,
             # Force a single progressive stream (has both audio+video) to avoid ffmpeg merge
             # Prefer MP4; fall back to any progressive format with audio
-            "format": "best[acodec!=none][vcodec!=none][ext=mp4]/best[acodec!=none][vcodec!=none]",
+            "format": (
+                f"best[acodec!=none][vcodec!=none][ext=mp4][height<={target_height}]/"
+                f"best[acodec!=none][vcodec!=none][height<={target_height}]/"
+                "best[acodec!=none][vcodec!=none][ext=mp4]/best[acodec!=none][vcodec!=none]"
+            ) if target_height else "best[acodec!=none][vcodec!=none][ext=mp4]/best[acodec!=none][vcodec!=none]",
         }
         if cookies_file:
             ydl_opts["cookiefile"] = cookies_file
@@ -249,8 +263,8 @@ def _download_video_to_tmp(url: str, progress_id: str | None = None, cookies_fil
 
             title = info.get("title") or "video"
 
-            # Final compatibility pass: force H.264/AAC with faststart to maximize player support
-            if ffmpeg_available:
+            # Optional compatibility pass: only when not in fast mode
+            if ffmpeg_available and not fast:
                 compatible_path = os.path.join(temp_dir, f"{title}.compat.mp4")
                 try:
                     # -movflags +faststart moves moov atom to the beginning
@@ -387,6 +401,7 @@ def download(
     link_only: bool = Query(True, description="Return JSON with a hosted file link instead of file data"),
     progress_id: str | None = Query(None, description="Client-provided id to poll progress at /progress/{id}"),
     cookies_b64: str | None = Query(None, description="Optional base64-encoded Netscape cookies.txt for yt-dlp"),
+    fast: bool = Query(True, description="Skip re-encoding when possible; fastest path"),
     background_tasks: BackgroundTasks = None,
 ):
     # Ensure a progress id for clients that want to poll
@@ -423,7 +438,7 @@ def download(
         cookies_path = COOKIES_FILE
         logger.info("/download: using cookies from env file")
 
-    temp_dir, file_path, title = _download_video_to_tmp(url, progress_id, cookies_path)
+    temp_dir, file_path, title = _download_video_to_tmp(url, progress_id, cookies_path, target_height=height, fast=fast)
 
     # Schedule cleanup after response is sent
     if background_tasks is not None:
@@ -440,7 +455,8 @@ def download(
 
     # Transcode to requested ext/height if needed
     out_path = file_path
-    if _has_ffmpeg():
+    # Only transcode when necessary: custom container (not mp4) or explicit height AND fast==False
+    if _has_ffmpeg() and ((ext != "mp4") or (height is not None and not fast)):
         # Mark transcoding stage for visibility
         if progress_id in JOB_PROGRESS:
             JOB_PROGRESS[progress_id].update({"stage": "transcoding"})
