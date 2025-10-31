@@ -145,7 +145,11 @@ async def _cleanup_downloads_loop() -> None:
     while True:
         now_ts = time.time()
         _cleanup_downloads_once(now_ts)
-        await asyncio.sleep(CLEANUP_INTERVAL_SECONDS)
+        try:
+            await asyncio.sleep(CLEANUP_INTERVAL_SECONDS)
+        except BaseException:
+            # Exit silently on cancellation
+            break
 
 
 def _progress_printer(d: dict) -> None:
@@ -555,7 +559,8 @@ async def _shutdown_cleanup_task() -> None:
         CLEANUP_TASK.cancel()
         try:
             await CLEANUP_TASK
-        except Exception:
+        except BaseException:
+            # Swallow cancellation and any shutdown-related exceptions
             pass
         CLEANUP_TASK = None
 
