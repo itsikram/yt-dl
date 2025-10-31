@@ -440,7 +440,6 @@ def download(
         dest_name = filename
         dest_path = os.path.join(DOWNLOAD_DIR, dest_name)
         if os.path.exists(dest_path):
-            import uuid
             dest_name = f"{name}-{uuid.uuid4().hex[:8]}{ext_actual}"
             dest_path = os.path.join(DOWNLOAD_DIR, dest_name)
         shutil.move(file_path, dest_path)
