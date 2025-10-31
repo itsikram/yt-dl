@@ -7,6 +7,7 @@ import shutil
 import tempfile
 import subprocess
 from typing import Tuple
+import logging
 import urllib.parse
 import uuid
 import asyncio
@@ -19,6 +20,9 @@ except Exception:
     imageio_ffmpeg = None
 
 app = FastAPI(title="YouTube MP4 Downloader")
+
+# Logger
+logger = logging.getLogger("ytvdl")
 
 # Allow cross-origin video playback from web apps (Android/iOS browsers)
 app.add_middleware(
@@ -295,9 +299,11 @@ def _download_video_to_tmp(url: str, progress_id: str | None = None) -> Tuple[st
     except yt_dlp.utils.DownloadError as e:
         # Clean up if we failed during download
         shutil.rmtree(temp_dir, ignore_errors=True)
+        logger.exception("yt-dlp download error for url=%s", url)
         raise HTTPException(status_code=400, detail=f"Download error: {str(e)}")
     except Exception as e:
         shutil.rmtree(temp_dir, ignore_errors=True)
+        logger.exception("Unhandled server error during download for url=%s", url)
         raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
 
 
@@ -378,6 +384,15 @@ def download(
         progress_id = uuid.uuid4().hex
     JOB_PROGRESS[progress_id] = {"stage": "starting", "status": "running", "pct": 0.0}
 
+    try:
+        logger.info(
+            "Request /download: url=%s ext=%s height=%s disposition=%s link_only=%s progress_id=%s",
+            url, ext, height, disposition, link_only, progress_id,
+        )
+    except Exception:
+        # Avoid breaking the request due to logging issues
+        pass
+
     temp_dir, file_path, title = _download_video_to_tmp(url, progress_id)
 
     # Schedule cleanup after response is sent
@@ -411,6 +426,7 @@ def download(
                 pass
             file_path = out_path
         except subprocess.CalledProcessError:
+            logger.exception("ffmpeg transcode failed: src=%s dst=%s ext=%s height=%s", file_path, out_path, ext, height)
             # If transcode fails, fall back to original
             file_path = out_path if os.path.exists(out_path) else file_path
 
@@ -461,6 +477,13 @@ def download(
 @app.on_event("startup")
 async def _startup_cleanup_task() -> None:
     global CLEANUP_TASK
+    try:
+        # Force ffmpeg resolution and log environment
+        available = _has_ffmpeg()
+        logger.info("Startup: DOWNLOAD_DIR=%s", DOWNLOAD_DIR)
+        logger.info("Startup: FFMPEG_EXE=%s available=%s", FFMPEG_EXE, available)
+    except Exception:
+        logger.exception("Startup: failed to resolve ffmpeg or log env")
     # Kick off background cleanup loop
     if CLEANUP_TASK is None or CLEANUP_TASK.done():
         CLEANUP_TASK = asyncio.create_task(_cleanup_downloads_loop())
