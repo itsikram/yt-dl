@@ -1,0 +1,102 @@
+# OS-specific
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Icon?
+Desktop.ini
+
+# Logs and PIDs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+*.pid
+*.pid.lock
+*.seed
+
+# Environment files (secrets)
+.env
+.env.local
+.env.*.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Editor/IDE
+.vscode/
+.idea/
+*.iml
+
+# Python
+__pycache__/
+ffmpeg/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.dll
+*.egg-info/
+dist/
+build/
+.site-packages/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.cache/
+.ipynb_checkpoints
+venv/
+.venv/
+ENV/
+env/
+pip-wheel-metadata/
+.tox/
+
+# Node / JavaScript / TypeScript
+node_modules/
+bower_components/
+.npm/
+.pnpm-store/
+.next/
+.nuxt/
+out/
+dist/
+build/
+storybook-static/
+coverage/
+.turbo/
+.parcel-cache/
+.eslintcache
+.stylelintcache
+tsconfig.tsbuildinfo
+
+# React Native / Android / iOS
+app/android/.gradle/
+app/android/build/
+app/android/app/build/
+app/android/local.properties
+app/android/.cxx/
+app/android/.externalNativeBuild/
+ios/Pods/
+ios/build/
+ios/DerivedData/
+*.xcworkspace
+*.xcuserstate
+*.xcuserdatad/
+*.xcodeproj/project.xcworkspace/
+
+# Misc
+*.swp
+*.swo
+*.orig
+*.rej
+
+# Render / deployment
+.render/
+
+# Project-specific
+replay_pid*.log
