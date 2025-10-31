@@ -30,13 +30,18 @@ app.add_middleware(
 )
 
 
-# Directory to persist downloadable files and expose via /files
-DOWNLOAD_DIR = os.path.join(os.path.dirname(__file__), "downloads")
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+# Directory to persist downloadable files and expose via /files.
+# Default to OS temp dir for compatibility with read-only roots on some hosts.
+DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR") or os.path.join(tempfile.gettempdir(), "ytvdl_downloads")
+try:
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+except Exception as e:
+    raise RuntimeError(f"Cannot create DOWNLOAD_DIR '{DOWNLOAD_DIR}': {e}")
 app.mount("/files", StaticFiles(directory=DOWNLOAD_DIR), name="files")
 
 
-FFMPEG_EXE = None
+# Allow overriding ffmpeg path via environment; otherwise resolve automatically
+FFMPEG_EXE = os.getenv("FFMPEG_EXE")
 # In-memory progress store keyed by a client/job-provided progress_id
 JOB_PROGRESS: dict[str, dict] = {}
 
