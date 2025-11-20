@@ -240,10 +240,14 @@ def _download_video_to_tmp(
             # Always end with bestvideo+bestaudio/best as ultimate fallback
             "format": (
                 f"bestvideo[ext=mp4][vcodec^=avc1][height<={target_height}]+bestaudio[ext=m4a]/"
+                f"bestvideo[height<={target_height}]+bestaudio[ext=m4a]/"
+                f"bestvideo[height<={target_height}]+bestaudio/"
                 f"best[ext=mp4][height<={target_height}]/best[height<={target_height}]/"
-                "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/best[ext=mp4]/"
-                "bestvideo+bestaudio/best"
-            ) if target_height else "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/best[ext=mp4]/bestvideo+bestaudio/best",
+                "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/"
+                "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
+                "bestvideo+bestaudio[ext=m4a]/"
+                "bestvideo+bestaudio/best[ext=mp4]/best"
+            ) if target_height else "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best",
         }
         if cookies_file:
             ydl_opts["cookiefile"] = cookies_file
@@ -267,7 +271,9 @@ def _download_video_to_tmp(
             "format": (
                 f"best[acodec!=none][vcodec!=none][ext=mp4][height<={target_height}]/"
                 f"best[acodec!=none][vcodec!=none][height<={target_height}]/"
-                "best[acodec!=none][vcodec!=none][ext=mp4]/best[acodec!=none][vcodec!=none]/best"
+                "best[acodec!=none][vcodec!=none][ext=mp4]/"
+                "best[acodec!=none][vcodec!=none]/"
+                "best"
             ) if target_height else "best[acodec!=none][vcodec!=none][ext=mp4]/best[acodec!=none][vcodec!=none]/best",
         }
         if cookies_file:
@@ -277,96 +283,122 @@ def _download_video_to_tmp(
         else:
             ydl_opts["progress_hooks"] = [_progress_printer]
 
+    # Try download with preferred format selector, fallback to simpler selector on error
+    info = None
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            # Derive final filepath; postprocessing may change extension
+            # Store prepared filename before exiting context
             prepared = ydl.prepare_filename(info)
-            base, _ = os.path.splitext(prepared)
-            candidates = [
-                prepared,
-                base + ".mp4",
-                base + ".mkv",  # sometimes merges default to mkv
-                base + ".webm",
-            ]
-            file_path = next((p for p in candidates if os.path.exists(p)), None)
-            if not file_path:
-                raise HTTPException(status_code=500, detail="Download succeeded but file not found.")
+    except yt_dlp.utils.DownloadError as format_error:
+        # If format selector failed, retry with a more lenient selector
+        if "Requested format is not available" in str(format_error) or "format is not available" in str(format_error):
+            logger.warning("Format selector failed, retrying with lenient selector for url=%s", url)
+            # Create a simpler, more lenient format selector
+            if ffmpeg_available:
+                ydl_opts["format"] = "bestvideo+bestaudio/best"
+            else:
+                ydl_opts["format"] = "best[acodec!=none][vcodec!=none]/best"
+            # Retry with lenient selector
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                    # Store prepared filename before exiting context
+                    prepared = ydl.prepare_filename(info)
+            except yt_dlp.utils.DownloadError as retry_error:
+                # Clean up and re-raise the original error
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                logger.exception("yt-dlp download error (retry failed) for url=%s", url)
+                raise HTTPException(status_code=400, detail=f"Download error: {str(retry_error)}")
+        else:
+            # For other download errors, clean up and re-raise
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            logger.exception("yt-dlp download error for url=%s", url)
+            raise HTTPException(status_code=400, detail=f"Download error: {str(format_error)}")
+    
+    try:
+        # Continue with file processing
+        # Derive final filepath; postprocessing may change extension
+        base, _ = os.path.splitext(prepared)
+        candidates = [
+            prepared,
+            base + ".mp4",
+            base + ".mkv",  # sometimes merges default to mkv
+            base + ".webm",
+        ]
+        file_path = next((p for p in candidates if os.path.exists(p)), None)
+        if not file_path:
+            raise HTTPException(status_code=500, detail="Download succeeded but file not found.")
 
-            # Enforce MP4 output
-            if not file_path.lower().endswith(".mp4"):
-                if ffmpeg_available:
-                    # If FFmpeg was available, we expected mp4 already
-                    raise HTTPException(status_code=500, detail="Failed to remux to MP4.")
-                # Without FFmpeg we cannot convert; instruct user
-                raise HTTPException(
-                    status_code=415,
-                    detail="MP4 not available for this video without FFmpeg. Install FFmpeg and try again.",
+        # Enforce MP4 output
+        if not file_path.lower().endswith(".mp4"):
+            if ffmpeg_available:
+                # If FFmpeg was available, we expected mp4 already
+                raise HTTPException(status_code=500, detail="Failed to remux to MP4.")
+            # Without FFmpeg we cannot convert; instruct user
+            raise HTTPException(
+                status_code=415,
+                detail="MP4 not available for this video without FFmpeg. Install FFmpeg and try again.",
+            )
+
+        title = info.get("title") or "video"
+
+        # Optional compatibility pass: only when not in fast mode
+        if ffmpeg_available and not fast:
+            compatible_path = os.path.join(temp_dir, f"{title}.compat.mp4")
+            try:
+                # -movflags +faststart moves moov atom to the beginning
+                # Baseline@3.1, CFR 30 fps, yuv420p, AAC-LC stereo for maximum browser/WMP compatibility
+                print("[ffmpeg] Transcoding for compatibility...")
+                subprocess.run(
+                    [
+                        FFMPEG_EXE or "ffmpeg",
+                        "-y",
+                        "-i",
+                        file_path,
+                        # map first video and first audio only; drop subs/data/metadata/chapters
+                        "-map", "0:v:0",
+                        "-map", "0:a:0?",
+                        "-sn",
+                        "-dn",
+                        "-map_metadata", "-1",
+                        "-map_chapters", "-1",
+                        # video
+                        "-c:v", "libx264",
+                        "-preset", "veryfast",
+                        "-crf", "23",
+                        "-pix_fmt", "yuv420p",
+                        "-profile:v", "baseline",
+                        "-level:v", "3.1",
+                        "-r", "30",
+                        "-g", "60",
+                        "-keyint_min", "60",
+                        "-sc_threshold", "0",
+                        # audio
+                        "-c:a", "aac",
+                        "-b:a", "128k",
+                        "-ar", "44100",
+                        "-ac", "2",
+                        # container flags
+                        "-movflags", "+faststart",
+                        compatible_path,
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=True,
                 )
-
-            title = info.get("title") or "video"
-
-            # Optional compatibility pass: only when not in fast mode
-            if ffmpeg_available and not fast:
-                compatible_path = os.path.join(temp_dir, f"{title}.compat.mp4")
+                print("[ffmpeg] Transcode done.")
+                # Replace file_path with the compatible output and remove the original
                 try:
-                    # -movflags +faststart moves moov atom to the beginning
-                    # Baseline@3.1, CFR 30 fps, yuv420p, AAC-LC stereo for maximum browser/WMP compatibility
-                    print("[ffmpeg] Transcoding for compatibility...")
-                    subprocess.run(
-                        [
-                            FFMPEG_EXE or "ffmpeg",
-                            "-y",
-                            "-i",
-                            file_path,
-                            # map first video and first audio only; drop subs/data/metadata/chapters
-                            "-map", "0:v:0",
-                            "-map", "0:a:0?",
-                            "-sn",
-                            "-dn",
-                            "-map_metadata", "-1",
-                            "-map_chapters", "-1",
-                            # video
-                            "-c:v", "libx264",
-                            "-preset", "veryfast",
-                            "-crf", "23",
-                            "-pix_fmt", "yuv420p",
-                            "-profile:v", "baseline",
-                            "-level:v", "3.1",
-                            "-r", "30",
-                            "-g", "60",
-                            "-keyint_min", "60",
-                            "-sc_threshold", "0",
-                            # audio
-                            "-c:a", "aac",
-                            "-b:a", "128k",
-                            "-ar", "44100",
-                            "-ac", "2",
-                            # container flags
-                            "-movflags", "+faststart",
-                            compatible_path,
-                        ],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        check=True,
-                    )
-                    print("[ffmpeg] Transcode done.")
-                    # Replace file_path with the compatible output and remove the original
-                    try:
-                        os.remove(file_path)
-                    except Exception:
-                        pass
-                    file_path = compatible_path
-                except subprocess.CalledProcessError:
-                    # If transcode fails, fall back to the downloaded file
+                    os.remove(file_path)
+                except Exception:
                     pass
+                file_path = compatible_path
+            except subprocess.CalledProcessError:
+                # If transcode fails, fall back to the downloaded file
+                pass
 
-            return temp_dir, file_path, title
-    except yt_dlp.utils.DownloadError as e:
-        # Clean up if we failed during download
-        shutil.rmtree(temp_dir, ignore_errors=True)
-        logger.exception("yt-dlp download error for url=%s", url)
-        raise HTTPException(status_code=400, detail=f"Download error: {str(e)}")
+        return temp_dir, file_path, title
     except Exception as e:
         shutil.rmtree(temp_dir, ignore_errors=True)
         logger.exception("Unhandled server error during download for url=%s", url)
