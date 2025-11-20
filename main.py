@@ -237,11 +237,13 @@ def _download_video_to_tmp(
                 {"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"},
             ],
             # Prioritize H.264/AAC; if a height is requested, try to cap at that height to avoid transcoding
+            # Always end with bestvideo+bestaudio/best as ultimate fallback
             "format": (
                 f"bestvideo[ext=mp4][vcodec^=avc1][height<={target_height}]+bestaudio[ext=m4a]/"
                 f"best[ext=mp4][height<={target_height}]/best[height<={target_height}]/"
-                "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/best[ext=mp4]/best"
-            ) if target_height else "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+                "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/best[ext=mp4]/"
+                "bestvideo+bestaudio/best"
+            ) if target_height else "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/best[ext=mp4]/bestvideo+bestaudio/best",
         }
         if cookies_file:
             ydl_opts["cookiefile"] = cookies_file
@@ -261,11 +263,12 @@ def _download_video_to_tmp(
             "restrictfilenames": True,
             # Force a single progressive stream (has both audio+video) to avoid ffmpeg merge
             # Prefer MP4; fall back to any progressive format with audio
+            # Always end with best as ultimate fallback
             "format": (
                 f"best[acodec!=none][vcodec!=none][ext=mp4][height<={target_height}]/"
                 f"best[acodec!=none][vcodec!=none][height<={target_height}]/"
-                "best[acodec!=none][vcodec!=none][ext=mp4]/best[acodec!=none][vcodec!=none]"
-            ) if target_height else "best[acodec!=none][vcodec!=none][ext=mp4]/best[acodec!=none][vcodec!=none]",
+                "best[acodec!=none][vcodec!=none][ext=mp4]/best[acodec!=none][vcodec!=none]/best"
+            ) if target_height else "best[acodec!=none][vcodec!=none][ext=mp4]/best[acodec!=none][vcodec!=none]/best",
         }
         if cookies_file:
             ydl_opts["cookiefile"] = cookies_file
