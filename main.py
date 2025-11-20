@@ -237,7 +237,7 @@ def _download_video_to_tmp(
                 {"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"},
             ],
             # Prioritize H.264/AAC; if a height is requested, try to cap at that height to avoid transcoding
-            # Always end with bestvideo+bestaudio/best as ultimate fallback
+            # Always end with best as ultimate fallback
             "format": (
                 f"bestvideo[ext=mp4][vcodec^=avc1][height<={target_height}]+bestaudio[ext=m4a]/"
                 f"bestvideo[height<={target_height}]+bestaudio[ext=m4a]/"
@@ -285,6 +285,7 @@ def _download_video_to_tmp(
 
     # Try download with preferred format selector, fallback to simpler selector on error
     info = None
+    prepared = None
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
@@ -294,22 +295,36 @@ def _download_video_to_tmp(
         # If format selector failed, retry with a more lenient selector
         if "Requested format is not available" in str(format_error) or "format is not available" in str(format_error):
             logger.warning("Format selector failed, retrying with lenient selector for url=%s", url)
-            # Create a simpler, more lenient format selector
+            # Try progressively simpler format selectors
+            retry_selectors = []
             if ffmpeg_available:
-                ydl_opts["format"] = "bestvideo+bestaudio/best"
+                # With FFmpeg, try bestvideo+bestaudio first, then just best
+                retry_selectors = ["bestvideo+bestaudio/best", "best"]
             else:
-                ydl_opts["format"] = "best[acodec!=none][vcodec!=none]/best"
-            # Retry with lenient selector
-            try:
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(url, download=True)
-                    # Store prepared filename before exiting context
-                    prepared = ydl.prepare_filename(info)
-            except yt_dlp.utils.DownloadError as retry_error:
-                # Clean up and re-raise the original error
+                # Without FFmpeg, try progressive streams first, then just best
+                retry_selectors = ["best[acodec!=none][vcodec!=none]/best", "best"]
+            
+            # Try each retry selector in order
+            last_error = format_error
+            for retry_selector in retry_selectors:
+                try:
+                    logger.warning("Retrying with format selector: %s for url=%s", retry_selector, url)
+                    ydl_opts["format"] = retry_selector
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        info = ydl.extract_info(url, download=True)
+                        # Store prepared filename before exiting context
+                        prepared = ydl.prepare_filename(info)
+                        # Success! Break out of retry loop
+                        break
+                except yt_dlp.utils.DownloadError as retry_error:
+                    last_error = retry_error
+                    # Continue to next retry selector
+                    continue
+            else:
+                # All retries failed
                 shutil.rmtree(temp_dir, ignore_errors=True)
-                logger.exception("yt-dlp download error (retry failed) for url=%s", url)
-                raise HTTPException(status_code=400, detail=f"Download error: {str(retry_error)}")
+                logger.exception("yt-dlp download error (all format selectors failed) for url=%s", url)
+                raise HTTPException(status_code=400, detail=f"Download error: {str(last_error)}")
         else:
             # For other download errors, clean up and re-raise
             shutil.rmtree(temp_dir, ignore_errors=True)
