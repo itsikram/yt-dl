@@ -223,117 +223,183 @@ def _download_video_to_tmp(
 
     ffmpeg_available = _has_ffmpeg()
 
-    # Prefer MP4 output. With FFmpeg we can merge/convert; without, try progressive MP4.
+    def _build_ydl_opts(format_selector: str) -> dict:
+        """Build yt-dlp options with the given format selector."""
+        opts = {
+            "outtmpl": os.path.join(temp_dir, "%(title)s.%(ext)s"),
+            "noplaylist": True,
+            "quiet": False,
+            "no_warnings": True,
+            "restrictfilenames": True,
+            "format": format_selector,
+            # Add headers to avoid blocking
+            "http_headers": {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-us,en;q=0.5",
+                "Accept-Encoding": "gzip, deflate",
+                "Referer": "https://www.youtube.com/",
+            },
+            # Fragment retry options for HLS
+            "fragment_retries": 10,
+            "retries": 10,
+            "file_access_retries": 3,
+            # Prefer native downloader over external for better compatibility
+            "external_downloader": None,
+            "external_downloader_args": None,
+        }
+        
+        if ffmpeg_available:
+            opts.update({
+                "merge_output_format": "mp4",
+                "postprocessors": [
+                    {"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"},
+                ],
+            })
+            if _has_ffmpeg():
+                opts["ffmpeg_location"] = FFMPEG_EXE
+        
+        if cookies_file:
+            opts["cookiefile"] = cookies_file
+        
+        if progress_id:
+            opts["progress_hooks"] = [_make_progress_hook(progress_id)]
+        else:
+            opts["progress_hooks"] = [_progress_printer]
+        
+        return opts
+
+    # Build format selectors - prefer progressive formats over HLS when possible
+    # Note: We can't easily exclude HLS in format selector, so we rely on retry logic
+    # and fragment retry options to handle HLS failures
     if ffmpeg_available:
-        ydl_opts = {
-            "outtmpl": os.path.join(temp_dir, "%(title)s.%(ext)s"),
-            "noplaylist": True,
-            "quiet": False,
-            "no_warnings": True,
-            "restrictfilenames": True,
-            # Prefer H.264 video (avc1) + AAC (m4a) and remux to mp4
-            "merge_output_format": "mp4",
-            "postprocessors": [
-                {"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"},
-            ],
-            # Prioritize H.264/AAC; if a height is requested, try to cap at that height to avoid transcoding
-            # Always end with best as ultimate fallback
-            "format": (
-                f"bestvideo[ext=mp4][vcodec^=avc1][height<={target_height}]+bestaudio[ext=m4a]/"
-                f"bestvideo[height<={target_height}]+bestaudio[ext=m4a]/"
-                f"bestvideo[height<={target_height}]+bestaudio/"
-                f"best[ext=mp4][height<={target_height}]/best[height<={target_height}]/"
-                "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/"
-                "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
-                "bestvideo+bestaudio[ext=m4a]/"
-                "bestvideo+bestaudio/best[ext=mp4]/best"
-            ) if target_height else "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best",
-        }
-        if cookies_file:
-            ydl_opts["cookiefile"] = cookies_file
-        if _has_ffmpeg():
-            # Point yt-dlp to the bundled/system ffmpeg executable
-            ydl_opts["ffmpeg_location"] = FFMPEG_EXE
-        if progress_id:
-            ydl_opts["progress_hooks"] = [_make_progress_hook(progress_id)]
-        else:
-            ydl_opts["progress_hooks"] = [_progress_printer]
+        # With FFmpeg: prefer separate video+audio streams
+        primary_format = (
+            f"bestvideo[ext=mp4][vcodec^=avc1][height<={target_height}]+bestaudio[ext=m4a]/"
+            f"bestvideo[ext=mp4][height<={target_height}]+bestaudio[ext=m4a]/"
+            f"bestvideo[height<={target_height}]+bestaudio[ext=m4a]/"
+            f"bestvideo[height<={target_height}]+bestaudio/"
+            f"best[ext=mp4][height<={target_height}]/best[height<={target_height}]/"
+            "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/"
+            "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
+            "bestvideo+bestaudio[ext=m4a]/"
+            "bestvideo+bestaudio/best[ext=mp4]/best"
+        ) if target_height else (
+            "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/"
+            "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
+            "bestvideo+bestaudio[ext=m4a]/"
+            "bestvideo+bestaudio/best[ext=mp4]/best"
+        )
     else:
-        ydl_opts = {
-            "outtmpl": os.path.join(temp_dir, "%(title)s.%(ext)s"),
-            "noplaylist": True,
-            "quiet": False,
-            "no_warnings": True,
-            "restrictfilenames": True,
-            # Force a single progressive stream (has both audio+video) to avoid ffmpeg merge
-            # Prefer MP4; fall back to any progressive format with audio
-            # Always end with best as ultimate fallback
-            "format": (
-                f"best[acodec!=none][vcodec!=none][ext=mp4][height<={target_height}]/"
-                f"best[acodec!=none][vcodec!=none][height<={target_height}]/"
-                "best[acodec!=none][vcodec!=none][ext=mp4]/"
-                "best[acodec!=none][vcodec!=none]/"
-                "best"
-            ) if target_height else "best[acodec!=none][vcodec!=none][ext=mp4]/best[acodec!=none][vcodec!=none]/best",
-        }
-        if cookies_file:
-            ydl_opts["cookiefile"] = cookies_file
-        if progress_id:
-            ydl_opts["progress_hooks"] = [_make_progress_hook(progress_id)]
-        else:
-            ydl_opts["progress_hooks"] = [_progress_printer]
+        # Without FFmpeg: must use progressive streams (single file with audio+video)
+        primary_format = (
+            f"best[acodec!=none][vcodec!=none][ext=mp4][height<={target_height}]/"
+            f"best[acodec!=none][vcodec!=none][height<={target_height}]/"
+            "best[acodec!=none][vcodec!=none][ext=mp4]/"
+            "best[acodec!=none][vcodec!=none]/"
+            "best"
+        ) if target_height else (
+            "best[acodec!=none][vcodec!=none][ext=mp4]/"
+            "best[acodec!=none][vcodec!=none]/"
+            "best"
+        )
+
+    # Retry selectors (progressively simpler)
+    retry_selectors = []
+    if ffmpeg_available:
+        retry_selectors = [
+            "bestvideo+bestaudio/best",
+            "best",
+        ]
+    else:
+        retry_selectors = [
+            "best[acodec!=none][vcodec!=none]/best",
+            "best",
+        ]
 
     # Try download with preferred format selector, fallback to simpler selector on error
     info = None
     prepared = None
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            # Store prepared filename before exiting context
-            prepared = ydl.prepare_filename(info)
-    except yt_dlp.utils.DownloadError as format_error:
-        # If format selector failed, retry with a more lenient selector
-        if "Requested format is not available" in str(format_error) or "format is not available" in str(format_error):
-            logger.warning("Format selector failed, retrying with lenient selector for url=%s", url)
-            # Try progressively simpler format selectors
-            retry_selectors = []
-            if ffmpeg_available:
-                # With FFmpeg, try bestvideo+bestaudio first, then just best
-                retry_selectors = ["bestvideo+bestaudio/best", "best"]
-            else:
-                # Without FFmpeg, try progressive streams first, then just best
-                retry_selectors = ["best[acodec!=none][vcodec!=none]/best", "best"]
+    file_path = None
+    last_error = None
+    
+    all_selectors = [primary_format] + retry_selectors
+    
+    for attempt, format_selector in enumerate(all_selectors):
+        try:
+            ydl_opts = _build_ydl_opts(format_selector)
+            logger.info("Attempt %d/%d: Trying format selector for url=%s", attempt + 1, len(all_selectors), url)
             
-            # Try each retry selector in order
-            last_error = format_error
-            for retry_selector in retry_selectors:
-                try:
-                    logger.warning("Retrying with format selector: %s for url=%s", retry_selector, url)
-                    ydl_opts["format"] = retry_selector
-                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                        info = ydl.extract_info(url, download=True)
-                        # Store prepared filename before exiting context
-                        prepared = ydl.prepare_filename(info)
-                        # Success! Break out of retry loop
-                        break
-                except yt_dlp.utils.DownloadError as retry_error:
-                    last_error = retry_error
-                    # Continue to next retry selector
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                prepared = ydl.prepare_filename(info)
+                
+                # Check if file actually exists and is not empty
+                base, _ = os.path.splitext(prepared)
+                candidates = [
+                    prepared,
+                    base + ".mp4",
+                    base + ".mkv",
+                    base + ".webm",
+                ]
+                file_path = next((p for p in candidates if os.path.exists(p)), None)
+                
+                if file_path and os.path.getsize(file_path) > 0:
+                    # Success! File exists and has content
+                    break
+                else:
+                    # File is empty or missing - this is the error we're trying to fix
+                    logger.warning("Download completed but file is empty or missing, trying next format selector")
+                    if file_path:
+                        try:
+                            os.remove(file_path)
+                        except Exception:
+                            pass
+                    file_path = None  # Reset for next attempt
+                    # Continue to next selector
+                    if attempt < len(all_selectors) - 1:
+                        continue
+                    else:
+                        raise yt_dlp.utils.DownloadError("The downloaded file is empty")
+                        
+        except yt_dlp.utils.DownloadError as download_error:
+            error_str = str(download_error)
+            last_error = download_error
+            
+            # Check if it's a format availability error or empty file error
+            is_format_error = ("Requested format is not available" in error_str or 
+                              "format is not available" in error_str)
+            is_empty_error = "downloaded file is empty" in error_str.lower()
+            
+            if is_format_error or is_empty_error:
+                # Try next selector
+                if attempt < len(all_selectors) - 1:
+                    logger.warning("Download failed (format/empty), retrying with next selector: %s", error_str)
                     continue
+                else:
+                    # Last attempt failed
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                    logger.exception("yt-dlp download error (all format selectors failed) for url=%s", url)
+                    raise HTTPException(status_code=400, detail=f"Download error: {str(last_error)}")
             else:
-                # All retries failed
+                # Other error - don't retry
                 shutil.rmtree(temp_dir, ignore_errors=True)
-                logger.exception("yt-dlp download error (all format selectors failed) for url=%s", url)
-                raise HTTPException(status_code=400, detail=f"Download error: {str(last_error)}")
-        else:
-            # For other download errors, clean up and re-raise
+                logger.exception("yt-dlp download error for url=%s", url)
+                raise HTTPException(status_code=400, detail=f"Download error: {str(download_error)}")
+        except Exception as e:
+            # Unexpected error
             shutil.rmtree(temp_dir, ignore_errors=True)
-            logger.exception("yt-dlp download error for url=%s", url)
-            raise HTTPException(status_code=400, detail=f"Download error: {str(format_error)}")
+            logger.exception("Unexpected error during download for url=%s", url)
+            raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+    
+    if info is None or prepared is None:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise HTTPException(status_code=400, detail="Download failed: all format selectors exhausted")
     
     try:
         # Continue with file processing
         # Derive final filepath; postprocessing may change extension
+        # (file_path was already determined in the retry loop above)
         base, _ = os.path.splitext(prepared)
         candidates = [
             prepared,
@@ -342,8 +408,8 @@ def _download_video_to_tmp(
             base + ".webm",
         ]
         file_path = next((p for p in candidates if os.path.exists(p)), None)
-        if not file_path:
-            raise HTTPException(status_code=500, detail="Download succeeded but file not found.")
+        if not file_path or os.path.getsize(file_path) == 0:
+            raise HTTPException(status_code=500, detail="Download succeeded but file not found or is empty.")
 
         # Enforce MP4 output
         if not file_path.lower().endswith(".mp4"):
