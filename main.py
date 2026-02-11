@@ -252,7 +252,9 @@ def _download_video_to_tmp(
         if format_selector is not None:
             opts["format"] = format_selector
         
-        if ffmpeg_available:
+        # Only add FFmpeg postprocessors if we have a format selector
+        # (when format_selector is None, let yt-dlp handle format selection naturally)
+        if ffmpeg_available and format_selector is not None:
             opts.update({
                 "merge_output_format": "mp4",
                 "postprocessors": [
@@ -261,6 +263,9 @@ def _download_video_to_tmp(
             })
             if _has_ffmpeg():
                 opts["ffmpeg_location"] = FFMPEG_EXE
+        elif ffmpeg_available and _has_ffmpeg():
+            # If no format selector, still set ffmpeg location but don't force merge format
+            opts["ffmpeg_location"] = FFMPEG_EXE
         
         if cookies_file:
             opts["cookiefile"] = cookies_file
@@ -422,12 +427,39 @@ def _download_video_to_tmp(
             logger.exception("Unexpected error during download for url=%s", url)
             raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
     
-    # If all format selectors failed, try one final time with yt-dlp default format selection
+    # If all format selectors failed, try one final time with absolutely minimal options
     if not download_success or info is None or prepared is None:
-        logger.warning("All format selectors failed, trying yt-dlp default format selection (no format parameter)")
+        logger.warning("All format selectors failed, trying absolutely minimal yt-dlp options")
         try:
-            ydl_opts = _build_ydl_opts(None)  # None means use yt-dlp default
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            # Use absolutely minimal options - no postprocessors, no forced formats
+            minimal_opts = {
+                "outtmpl": os.path.join(temp_dir, "%(title)s.%(ext)s"),
+                "noplaylist": True,
+                "quiet": False,
+                "no_warnings": True,
+                "restrictfilenames": True,
+                "format": "best",  # Simplest possible format selector
+                "http_headers": {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "en-us,en;q=0.5",
+                    "Accept-Encoding": "gzip, deflate",
+                    "Referer": "https://www.youtube.com/",
+                },
+                "fragment_retries": 10,
+                "retries": 10,
+                "file_access_retries": 3,
+            }
+            # Don't set merge_output_format or postprocessors - let yt-dlp handle format naturally
+            if cookies_file:
+                minimal_opts["cookiefile"] = cookies_file
+            if progress_id:
+                minimal_opts["progress_hooks"] = [_make_progress_hook(progress_id)]
+            # Only set ffmpeg location if available, but don't force postprocessing
+            if ffmpeg_available and _has_ffmpeg():
+                minimal_opts["ffmpeg_location"] = FFMPEG_EXE
+            
+            with yt_dlp.YoutubeDL(minimal_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
                 prepared = ydl.prepare_filename(info)
                 
@@ -446,11 +478,11 @@ def _download_video_to_tmp(
                         if 'filepath' in dl_info:
                             candidates.insert(0, dl_info['filepath'])
                 
-                # Scan temp_dir
+                # Scan temp_dir for any video/audio files
                 for entry in os.scandir(temp_dir):
                     if entry.is_file():
                         ext = os.path.splitext(entry.name)[1].lower()
-                        if ext in ['.mp4', '.mkv', '.webm']:
+                        if ext in ['.mp4', '.mkv', '.webm', '.m4a', '.mp3']:
                             candidates.append(entry.path)
                 
                 file_path = None
@@ -460,14 +492,14 @@ def _download_video_to_tmp(
                         break
                 
                 if file_path:
-                    logger.info("Success with yt-dlp default format selection: %s", file_path)
+                    logger.info("Success with minimal format selector 'best': %s", file_path)
                     download_success = True
                 else:
                     raise yt_dlp.utils.DownloadError("Download completed but file not found")
         except Exception as final_error:
-            # Even the default format selection failed
+            # Even the minimal approach failed
             shutil.rmtree(temp_dir, ignore_errors=True)
-            logger.exception("yt-dlp download error (all format selectors including default failed) for url=%s", url)
+            logger.exception("yt-dlp download error (all format selectors including minimal failed) for url=%s", url)
             raise HTTPException(status_code=400, detail=f"Download error: Unable to find compatible format. Last error: {str(final_error)}")
     
     if not download_success or info is None or prepared is None or file_path is None:
