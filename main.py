@@ -636,6 +636,14 @@ def healthz():
 @app.head("/healthz")
 def healthz_head():
     return Response(status_code=200)
+
+@app.get("/favicon.ico")
+def favicon():
+    favicon_path = os.path.join(os.path.dirname(__file__), "favicon.ico")
+    if os.path.exists(favicon_path):
+        return FileResponse(favicon_path, media_type="image/x-icon")
+    raise HTTPException(status_code=404, detail="Favicon not found")
+
 @app.get("/progress/{progress_id}")
 def get_progress(progress_id: str):
     data = JOB_PROGRESS.get(progress_id)
