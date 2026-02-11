@@ -270,48 +270,64 @@ def _download_video_to_tmp(
         return opts
 
     # Build format selectors - prefer progressive formats over HLS when possible
-    # Note: We can't easily exclude HLS in format selector, so we rely on retry logic
-    # and fragment retry options to handle HLS failures
+    # Note: When height is specified and FFmpeg is available, we download best quality
+    # and let FFmpeg handle scaling, avoiding restrictive format selectors that may fail
     if ffmpeg_available:
         # With FFmpeg: prefer separate video+audio streams
-        primary_format = (
-            f"bestvideo[ext=mp4][vcodec^=avc1][height<={target_height}]+bestaudio[ext=m4a]/"
-            f"bestvideo[ext=mp4][height<={target_height}]+bestaudio[ext=m4a]/"
-            f"bestvideo[height<={target_height}]+bestaudio[ext=m4a]/"
-            f"bestvideo[height<={target_height}]+bestaudio/"
-            f"best[ext=mp4][height<={target_height}]/best[height<={target_height}]/"
-            "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/"
-            "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
-            "bestvideo+bestaudio[ext=m4a]/"
-            "bestvideo+bestaudio/best[ext=mp4]/best"
-        ) if target_height else (
-            "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/"
-            "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
-            "bestvideo+bestaudio[ext=m4a]/"
-            "bestvideo+bestaudio/best[ext=mp4]/best"
-        )
+        # If height is specified, we'll download best quality and scale with ffmpeg
+        # This avoids format selection failures when YouTube doesn't have exact height matches
+        if target_height:
+            # Try with height constraint first (optimization), but have strong fallbacks
+            primary_format = (
+                f"bestvideo[ext=mp4][vcodec^=avc1][height<={target_height}]+bestaudio[ext=m4a]/"
+                f"bestvideo[ext=mp4][height<={target_height}]+bestaudio[ext=m4a]/"
+                f"bestvideo[height<={target_height}]+bestaudio[ext=m4a]/"
+                f"bestvideo[height<={target_height}]+bestaudio/"
+                # If height constraints fail, download best quality and scale with ffmpeg
+                "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/"
+                "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
+                "bestvideo+bestaudio[ext=m4a]/"
+                "bestvideo+bestaudio/best[ext=mp4]/best"
+            )
+        else:
+            primary_format = (
+                "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/"
+                "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
+                "bestvideo+bestaudio[ext=m4a]/"
+                "bestvideo+bestaudio/best[ext=mp4]/best"
+            )
     else:
         # Without FFmpeg: must use progressive streams (single file with audio+video)
-        primary_format = (
-            f"best[acodec!=none][vcodec!=none][ext=mp4][height<={target_height}]/"
-            f"best[acodec!=none][vcodec!=none][height<={target_height}]/"
-            "best[acodec!=none][vcodec!=none][ext=mp4]/"
-            "best[acodec!=none][vcodec!=none]/"
-            "best"
-        ) if target_height else (
-            "best[acodec!=none][vcodec!=none][ext=mp4]/"
-            "best[acodec!=none][vcodec!=none]/"
-            "best"
-        )
+        # Without FFmpeg, we can't scale, so we must find a format matching the height
+        if target_height:
+            primary_format = (
+                f"best[acodec!=none][vcodec!=none][ext=mp4][height<={target_height}]/"
+                f"best[acodec!=none][vcodec!=none][height<={target_height}]/"
+                # Try slightly higher heights
+                f"best[acodec!=none][vcodec!=none][ext=mp4][height<={min(target_height * 2, 1080)}]/"
+                f"best[acodec!=none][vcodec!=none][height<={min(target_height * 2, 1080)}]/"
+                # Fallback to formats without height constraint
+                "best[acodec!=none][vcodec!=none][ext=mp4]/"
+                "best[acodec!=none][vcodec!=none]/"
+                "best"
+            )
+        else:
+            primary_format = (
+                "best[acodec!=none][vcodec!=none][ext=mp4]/"
+                "best[acodec!=none][vcodec!=none]/"
+                "best"
+            )
 
-    # Retry selectors (progressively simpler)
+    # Retry selectors (progressively simpler) - these are tried as separate attempts
     retry_selectors = []
     if ffmpeg_available:
+        # With FFmpeg, we can always scale, so use simple selectors
         retry_selectors = [
             "bestvideo+bestaudio/best",
             "best",
         ]
     else:
+        # Without FFmpeg, need formats with both audio and video
         retry_selectors = [
             "best[acodec!=none][vcodec!=none]/best",
             "best",
@@ -368,7 +384,9 @@ def _download_video_to_tmp(
             
             # Check if it's a format availability error or empty file error
             is_format_error = ("Requested format is not available" in error_str or 
-                              "format is not available" in error_str)
+                              "format is not available" in error_str.lower() or
+                              "no video formats found" in error_str.lower() or
+                              "format selector" in error_str.lower())
             is_empty_error = "downloaded file is empty" in error_str.lower()
             
             if is_format_error or is_empty_error:
@@ -380,7 +398,7 @@ def _download_video_to_tmp(
                     # Last attempt failed
                     shutil.rmtree(temp_dir, ignore_errors=True)
                     logger.exception("yt-dlp download error (all format selectors failed) for url=%s", url)
-                    raise HTTPException(status_code=400, detail=f"Download error: {str(last_error)}")
+                    raise HTTPException(status_code=400, detail=f"Download error: Unable to find compatible format. Original error: {str(last_error)}")
             else:
                 # Other error - don't retry
                 shutil.rmtree(temp_dir, ignore_errors=True)
