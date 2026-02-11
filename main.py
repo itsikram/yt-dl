@@ -223,15 +223,14 @@ def _download_video_to_tmp(
 
     ffmpeg_available = _has_ffmpeg()
 
-    def _build_ydl_opts(format_selector: str) -> dict:
-        """Build yt-dlp options with the given format selector."""
+    def _build_ydl_opts(format_selector: str | None) -> dict:
+        """Build yt-dlp options with the given format selector. If None, uses yt-dlp default."""
         opts = {
             "outtmpl": os.path.join(temp_dir, "%(title)s.%(ext)s"),
             "noplaylist": True,
             "quiet": False,
             "no_warnings": True,
             "restrictfilenames": True,
-            "format": format_selector,
             # Add headers to avoid blocking
             "http_headers": {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -248,6 +247,10 @@ def _download_video_to_tmp(
             "external_downloader": None,
             "external_downloader_args": None,
         }
+        
+        # Only add format parameter if specified (None means use yt-dlp default)
+        if format_selector is not None:
+            opts["format"] = format_selector
         
         if ffmpeg_available:
             opts.update({
@@ -270,32 +273,17 @@ def _download_video_to_tmp(
         return opts
 
     # Build format selectors - prefer progressive formats over HLS when possible
-    # Note: When height is specified and FFmpeg is available, we download best quality
-    # and let FFmpeg handle scaling, avoiding restrictive format selectors that may fail
+    # Strategy: When FFmpeg is available, NEVER use height constraints in format selector
+    # Instead, download best quality and let FFmpeg scale it down
     if ffmpeg_available:
-        # With FFmpeg: prefer separate video+audio streams
-        # If height is specified, we'll download best quality and scale with ffmpeg
-        # This avoids format selection failures when YouTube doesn't have exact height matches
-        if target_height:
-            # Try with height constraint first (optimization), but have strong fallbacks
-            primary_format = (
-                f"bestvideo[ext=mp4][vcodec^=avc1][height<={target_height}]+bestaudio[ext=m4a]/"
-                f"bestvideo[ext=mp4][height<={target_height}]+bestaudio[ext=m4a]/"
-                f"bestvideo[height<={target_height}]+bestaudio[ext=m4a]/"
-                f"bestvideo[height<={target_height}]+bestaudio/"
-                # If height constraints fail, download best quality and scale with ffmpeg
-                "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/"
-                "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
-                "bestvideo+bestaudio[ext=m4a]/"
-                "bestvideo+bestaudio/best[ext=mp4]/best"
-            )
-        else:
-            primary_format = (
-                "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/"
-                "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
-                "bestvideo+bestaudio[ext=m4a]/"
-                "bestvideo+bestaudio/best[ext=mp4]/best"
-            )
+        # With FFmpeg: prefer separate video+audio streams, NO height constraints
+        # We'll scale with FFmpeg later, so get the best quality available
+        primary_format = (
+            "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/"
+            "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
+            "bestvideo+bestaudio[ext=m4a]/"
+            "bestvideo+bestaudio/best[ext=mp4]/best"
+        )
     else:
         # Without FFmpeg: must use progressive streams (single file with audio+video)
         # Without FFmpeg, we can't scale, so we must find a format matching the height
@@ -321,9 +309,10 @@ def _download_video_to_tmp(
     # Retry selectors (progressively simpler) - these are tried as separate attempts
     retry_selectors = []
     if ffmpeg_available:
-        # With FFmpeg, we can always scale, so use simple selectors
+        # With FFmpeg, we can always scale, so use very simple selectors
         retry_selectors = [
             "bestvideo+bestaudio/best",
+            "bestvideo/best",
             "best",
         ]
     else:
@@ -338,19 +327,24 @@ def _download_video_to_tmp(
     prepared = None
     file_path = None
     last_error = None
+    download_success = False
     
     all_selectors = [primary_format] + retry_selectors
     
     for attempt, format_selector in enumerate(all_selectors):
+        if download_success:
+            break
         try:
             ydl_opts = _build_ydl_opts(format_selector)
-            logger.info("Attempt %d/%d: Trying format selector for url=%s", attempt + 1, len(all_selectors), url)
+            selector_str = format_selector if format_selector else "(yt-dlp default)"
+            logger.info("Attempt %d/%d: Trying format selector '%s' for url=%s", attempt + 1, len(all_selectors), selector_str, url)
             
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
                 prepared = ydl.prepare_filename(info)
                 
-                # Check if file actually exists and is not empty
+                # After download, the actual file might have a different name due to post-processing
+                # Check multiple possible locations and extensions
                 base, _ = os.path.splitext(prepared)
                 candidates = [
                     prepared,
@@ -358,19 +352,38 @@ def _download_video_to_tmp(
                     base + ".mkv",
                     base + ".webm",
                 ]
-                file_path = next((p for p in candidates if os.path.exists(p)), None)
                 
-                if file_path and os.path.getsize(file_path) > 0:
+                # Also check if info has the actual filepath after post-processing
+                if info and 'requested_downloads' in info:
+                    for dl_info in info.get('requested_downloads', []):
+                        if 'filepath' in dl_info:
+                            candidates.insert(0, dl_info['filepath'])
+                
+                # Also scan temp_dir for video files (in case filename doesn't match expected pattern)
+                if not any(os.path.exists(c) for c in candidates):
+                    try:
+                        for entry in os.scandir(temp_dir):
+                            if entry.is_file():
+                                ext = os.path.splitext(entry.name)[1].lower()
+                                if ext in ['.mp4', '.mkv', '.webm']:
+                                    candidates.append(entry.path)
+                    except Exception:
+                        pass
+                
+                file_path = None
+                for candidate in candidates:
+                    if os.path.exists(candidate) and os.path.getsize(candidate) > 0:
+                        file_path = candidate
+                        break
+                
+                if file_path:
                     # Success! File exists and has content
+                    logger.info("Found downloaded file: %s (size: %d bytes)", file_path, os.path.getsize(file_path))
+                    download_success = True
                     break
                 else:
                     # File is empty or missing - this is the error we're trying to fix
                     logger.warning("Download completed but file is empty or missing, trying next format selector")
-                    if file_path:
-                        try:
-                            os.remove(file_path)
-                        except Exception:
-                            pass
                     file_path = None  # Reset for next attempt
                     # Continue to next selector
                     if attempt < len(all_selectors) - 1:
@@ -395,10 +408,9 @@ def _download_video_to_tmp(
                     logger.warning("Download failed (format/empty), retrying with next selector: %s", error_str)
                     continue
                 else:
-                    # Last attempt failed
-                    shutil.rmtree(temp_dir, ignore_errors=True)
-                    logger.exception("yt-dlp download error (all format selectors failed) for url=%s", url)
-                    raise HTTPException(status_code=400, detail=f"Download error: Unable to find compatible format. Original error: {str(last_error)}")
+                    # Last attempt failed - will try default format after loop
+                    logger.warning("All format selectors failed, will try yt-dlp default format selection")
+                    continue
             else:
                 # Other error - don't retry
                 shutil.rmtree(temp_dir, ignore_errors=True)
@@ -410,24 +422,93 @@ def _download_video_to_tmp(
             logger.exception("Unexpected error during download for url=%s", url)
             raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
     
-    if info is None or prepared is None:
+    # If all format selectors failed, try one final time with yt-dlp default format selection
+    if not download_success or info is None or prepared is None:
+        logger.warning("All format selectors failed, trying yt-dlp default format selection (no format parameter)")
+        try:
+            ydl_opts = _build_ydl_opts(None)  # None means use yt-dlp default
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                prepared = ydl.prepare_filename(info)
+                
+                # Find the downloaded file
+                base, _ = os.path.splitext(prepared)
+                candidates = [
+                    prepared,
+                    base + ".mp4",
+                    base + ".mkv",
+                    base + ".webm",
+                ]
+                
+                # Check info for actual filepath
+                if info and 'requested_downloads' in info:
+                    for dl_info in info.get('requested_downloads', []):
+                        if 'filepath' in dl_info:
+                            candidates.insert(0, dl_info['filepath'])
+                
+                # Scan temp_dir
+                for entry in os.scandir(temp_dir):
+                    if entry.is_file():
+                        ext = os.path.splitext(entry.name)[1].lower()
+                        if ext in ['.mp4', '.mkv', '.webm']:
+                            candidates.append(entry.path)
+                
+                file_path = None
+                for candidate in candidates:
+                    if os.path.exists(candidate) and os.path.getsize(candidate) > 0:
+                        file_path = candidate
+                        break
+                
+                if file_path:
+                    logger.info("Success with yt-dlp default format selection: %s", file_path)
+                    download_success = True
+                else:
+                    raise yt_dlp.utils.DownloadError("Download completed but file not found")
+        except Exception as final_error:
+            # Even the default format selection failed
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            logger.exception("yt-dlp download error (all format selectors including default failed) for url=%s", url)
+            raise HTTPException(status_code=400, detail=f"Download error: Unable to find compatible format. Last error: {str(final_error)}")
+    
+    if not download_success or info is None or prepared is None or file_path is None:
         shutil.rmtree(temp_dir, ignore_errors=True)
         raise HTTPException(status_code=400, detail="Download failed: all format selectors exhausted")
     
     try:
         # Continue with file processing
         # Derive final filepath; postprocessing may change extension
-        # (file_path was already determined in the retry loop above)
-        base, _ = os.path.splitext(prepared)
-        candidates = [
-            prepared,
-            base + ".mp4",
-            base + ".mkv",  # sometimes merges default to mkv
-            base + ".webm",
-        ]
-        file_path = next((p for p in candidates if os.path.exists(p)), None)
-        if not file_path or os.path.getsize(file_path) == 0:
-            raise HTTPException(status_code=500, detail="Download succeeded but file not found or is empty.")
+        # (file_path was already determined in the retry loop above, but verify it still exists)
+        if not file_path or not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
+            # Re-detect file if not found (shouldn't happen, but be safe)
+            base, _ = os.path.splitext(prepared)
+            candidates = [
+                prepared,
+                base + ".mp4",
+                base + ".mkv",  # sometimes merges default to mkv
+                base + ".webm",
+            ]
+            
+            # Check info for actual filepath after post-processing
+            if info and 'requested_downloads' in info:
+                for dl_info in info.get('requested_downloads', []):
+                    if 'filepath' in dl_info:
+                        candidates.insert(0, dl_info['filepath'])
+            
+            # Scan temp_dir as fallback
+            for entry in os.scandir(temp_dir):
+                if entry.is_file():
+                    ext = os.path.splitext(entry.name)[1].lower()
+                    if ext in ['.mp4', '.mkv', '.webm']:
+                        candidates.append(entry.path)
+            
+            file_path = None
+            for candidate in candidates:
+                if os.path.exists(candidate) and os.path.getsize(candidate) > 0:
+                    file_path = candidate
+                    break
+            
+            if not file_path or os.path.getsize(file_path) == 0:
+                raise HTTPException(status_code=500, detail="Download succeeded but file not found or is empty.")
 
         # Enforce MP4 output
         if not file_path.lower().endswith(".mp4"):
