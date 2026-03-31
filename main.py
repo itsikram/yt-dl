@@ -303,6 +303,8 @@ def _download_video_to_tmp(
             "noplaylist": True,
             "quiet": False,
             "no_warnings": True,
+            # Prevent host/global yt-dlp config from forcing a bad format selector.
+            "ignoreconfig": True,
             "restrictfilenames": True,
             # Add headers to avoid blocking
             "http_headers": {
@@ -515,6 +517,8 @@ def _download_video_to_tmp(
                 "noplaylist": True,
                 "quiet": False,
                 "no_warnings": True,
+                # Prevent environment config on host from injecting incompatible -f options.
+                "ignoreconfig": True,
                 "http_headers": {
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -567,6 +571,8 @@ def _download_video_to_tmp(
                     "noplaylist": True,
                     "quiet": False,
                     "no_warnings": True,
+                    # Keep fallback path independent from host/global yt-dlp config.
+                    "ignoreconfig": True,
                     "restrictfilenames": True,
                     "http_headers": {
                         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -580,13 +586,12 @@ def _download_video_to_tmp(
                     "file_access_retries": 3,
                 }
                 
-                # Use format ID if we found one, otherwise try "worst" (lowest quality, most compatible)
+                # Use discovered format ID; otherwise let yt-dlp pick automatically.
                 if working_format_id:
                     download_opts["format"] = working_format_id
                     logger.info("Trying download with format ID: %s", working_format_id)
                 else:
-                    download_opts["format"] = "worst"  # Try worst quality as last resort
-                    logger.info("Trying download with 'worst' format selector")
+                    logger.info("No specific format ID found; using yt-dlp default format selection")
                 
                 if cookies_file:
                     download_opts["cookiefile"] = cookies_file
@@ -786,6 +791,7 @@ def _download_audio_to_tmp(
         "noplaylist": True,
         "quiet": False,
         "no_warnings": True,
+        "ignoreconfig": True,
         "restrictfilenames": True,
         "format": "bestaudio/best",
         "ffmpeg_location": FFMPEG_EXE,
