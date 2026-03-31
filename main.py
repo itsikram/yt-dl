@@ -33,7 +33,7 @@ async def _lifespan(app: FastAPI):
         cookies_b64 = os.getenv("YTDLP_COOKIES_B64")
         if cookies_b64 and not COOKIES_FILE:
             try:
-                decoded = base64.b64decode(cookies_b64)
+                decoded = _decode_cookies_payload(cookies_b64)
                 import tempfile as _tf
                 cookies_tmp = _tf.NamedTemporaryFile(prefix="ytvdl_cookies_", suffix=".txt", delete=False)
                 with cookies_tmp as f:
@@ -89,6 +89,79 @@ JOB_PROGRESS: dict[str, dict] = {}
 
 # Optional cookies file to pass to yt-dlp (Netscape format), populated from env
 COOKIES_FILE: str | None = None
+
+
+def _looks_like_netscape_cookie_text(text: str) -> bool:
+    if not text:
+        return False
+    lowered = text.lower()
+    if "netscape http cookie file" in lowered:
+        return True
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "\t" in line and len(line.split("\t")) >= 7:
+            return True
+    return False
+
+
+def _normalize_netscape_cookie_text(text: str) -> str:
+    normalized = text.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\t", "\t")
+    normalized = normalized.replace("\r\n", "\n").strip()
+    lines: list[str] = []
+
+    for raw_line in normalized.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("#"):
+            lines.append(line)
+            continue
+
+        parts = [p.strip() for p in line.split("\t")] if "\t" in line else line.split()
+        if len(parts) < 7:
+            continue
+
+        cookie_value = " ".join(parts[6:])
+        fields = parts[:6] + [cookie_value]
+        lines.append("\t".join(fields))
+
+    if not lines:
+        raise ValueError("No cookie rows found in cookies payload")
+    if not any(not ln.startswith("#") for ln in lines):
+        raise ValueError("Cookies payload has no valid cookie entries")
+    if not any("netscape http cookie file" in ln.lower() for ln in lines if ln.startswith("#")):
+        lines.insert(0, "# Netscape HTTP Cookie File")
+
+    return "\n".join(lines) + "\n"
+
+
+def _decode_cookies_payload(payload: str) -> bytes:
+    if not payload:
+        raise ValueError("Empty cookies payload")
+
+    raw = payload.strip().strip("'").strip('"')
+    candidates = [raw, urllib.parse.unquote(raw), urllib.parse.unquote_plus(raw)]
+
+    for candidate in candidates:
+        if _looks_like_netscape_cookie_text(candidate):
+            return _normalize_netscape_cookie_text(candidate).encode("utf-8")
+
+        try:
+            decoded = base64.b64decode(candidate, validate=True)
+        except Exception:
+            continue
+
+        for encoding in ("utf-8", "latin-1"):
+            try:
+                decoded_text = decoded.decode(encoding)
+            except Exception:
+                continue
+            if _looks_like_netscape_cookie_text(decoded_text):
+                return _normalize_netscape_cookie_text(decoded_text).encode("utf-8")
+
+    raise ValueError("Cookies payload is neither valid base64 Netscape text nor raw Netscape text")
 
 
 def _make_progress_hook(progress_id: str):
@@ -945,7 +1018,7 @@ def download(
     cookies_owned: bool = False
     if cookies_b64:
         try:
-            decoded = base64.b64decode(cookies_b64)
+            decoded = _decode_cookies_payload(cookies_b64)
             import tempfile as _tf
             cookies_tmp = _tf.NamedTemporaryFile(prefix="ytvdl_req_cookies_", suffix=".txt", delete=False)
             with cookies_tmp as f:
@@ -954,8 +1027,8 @@ def download(
             cookies_owned = True
             logger.info("/download: using cookies from request param")
         except Exception:
-            logger.exception("/download: failed decoding/writing cookies_b64 param")
-            raise HTTPException(status_code=400, detail="Invalid cookies_b64 parameter")
+            logger.exception("/download: failed parsing/writing cookies_b64 param")
+            raise HTTPException(status_code=400, detail="Invalid cookies payload. Provide Netscape cookies text (raw or base64).")
     elif COOKIES_FILE:
         cookies_path = COOKIES_FILE
         logger.info("/download: using cookies from env file")
