@@ -164,6 +164,71 @@ def _decode_cookies_payload(payload: str) -> bytes:
     raise ValueError("Cookies payload is neither valid base64 Netscape text nor raw Netscape text")
 
 
+def _is_format_unavailable_error(error_text: str) -> bool:
+    lower = (error_text or "").lower()
+    return (
+        "requested format is not available" in lower
+        or "format is not available" in lower
+        or "no video formats found" in lower
+        or "format selector" in lower
+    )
+
+
+def _sanitize_youtube_url(url: str) -> str:
+    """Normalize YouTube URL by dropping non-essential tracking params."""
+    if not url:
+        return url
+    try:
+        parsed = urllib.parse.urlparse(url)
+        host = (parsed.netloc or "").lower()
+        if "youtube.com" not in host and "youtu.be" not in host:
+            return url
+
+        if "youtu.be" in host:
+            # Keep only canonical short URL path; tracking params are not required.
+            clean = parsed._replace(query="", fragment="")
+            return urllib.parse.urlunparse(clean)
+
+        query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=False)
+        keep_keys = {"v", "list", "index", "t", "start"}
+        cleaned_query = [(k, v) for k, v in query if k in keep_keys]
+        clean = parsed._replace(query=urllib.parse.urlencode(cleaned_query, doseq=True), fragment="")
+        return urllib.parse.urlunparse(clean)
+    except Exception:
+        return url
+
+
+def _base_ydl_http_headers() -> dict:
+    return {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:149.0) Gecko/20100101 Firefox/149.0",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-us,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate",
+        "Referer": "https://www.youtube.com/",
+    }
+
+
+def _base_ydl_opts() -> dict:
+    # Favor clients that are less likely to return format-unavailable in hosted environments.
+    return {
+        "noplaylist": True,
+        "quiet": False,
+        "no_warnings": True,
+        "ignoreconfig": True,
+        "http_headers": _base_ydl_http_headers(),
+        "fragment_retries": 10,
+        "retries": 10,
+        "file_access_retries": 3,
+        "external_downloader": None,
+        "external_downloader_args": None,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "web", "tv"],
+            }
+        },
+    }
+
+
 def _make_progress_hook(progress_id: str):
     def _hook(d: dict) -> None:
         status = d.get("status")
@@ -293,34 +358,16 @@ def _download_video_to_tmp(
     fetch a progressive MP4.
     """
     temp_dir = tempfile.mkdtemp(prefix="ytvdl_")
+    url = _sanitize_youtube_url(url)
 
     ffmpeg_available = _has_ffmpeg()
 
     def _build_ydl_opts(format_selector: str | None) -> dict:
         """Build yt-dlp options with the given format selector. If None, uses yt-dlp default."""
         opts = {
+            **_base_ydl_opts(),
             "outtmpl": os.path.join(temp_dir, "%(title)s.%(ext)s"),
-            "noplaylist": True,
-            "quiet": False,
-            "no_warnings": True,
-            # Prevent host/global yt-dlp config from forcing a bad format selector.
-            "ignoreconfig": True,
             "restrictfilenames": True,
-            # Add headers to avoid blocking
-            "http_headers": {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-us,en;q=0.5",
-                "Accept-Encoding": "gzip, deflate",
-                "Referer": "https://www.youtube.com/",
-            },
-            # Fragment retry options for HLS
-            "fragment_retries": 10,
-            "retries": 10,
-            "file_access_retries": 3,
-            # Prefer native downloader over external for better compatibility
-            "external_downloader": None,
-            "external_downloader_args": None,
         }
         
         # Only add format parameter if specified (None means use yt-dlp default)
@@ -482,16 +529,13 @@ def _download_video_to_tmp(
             last_error = download_error
             
             # Check if it's a format availability error or empty file error
-            is_format_error = ("Requested format is not available" in error_str or 
-                              "format is not available" in error_str.lower() or
-                              "no video formats found" in error_str.lower() or
-                              "format selector" in error_str.lower())
+            is_format_error = _is_format_unavailable_error(error_str)
             is_empty_error = "downloaded file is empty" in error_str.lower()
             
             if is_format_error or is_empty_error:
                 # Try next selector
                 if attempt < len(all_selectors) - 1:
-                    logger.warning("Download failed (format/empty), retrying with next selector: %s", error_str)
+                    logger.info("Format unavailable on attempt %d; trying next selector", attempt + 1)
                     continue
                 else:
                     # Last attempt failed - will try default format after loop
@@ -512,27 +556,21 @@ def _download_video_to_tmp(
     if not download_success or info is None or prepared is None:
         logger.warning("All format selectors failed, extracting info to see available formats")
         try:
+            working_format_id = None
             # First, extract info without downloading to see what formats are available
             info_opts = {
-                "noplaylist": True,
-                "quiet": False,
-                "no_warnings": True,
-                # Prevent environment config on host from injecting incompatible -f options.
-                "ignoreconfig": True,
-                "http_headers": {
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                    "Accept-Language": "en-us,en;q=0.5",
-                    "Accept-Encoding": "gzip, deflate",
-                    "Referer": "https://www.youtube.com/",
-                },
+                **_base_ydl_opts(),
             }
             if cookies_file:
                 info_opts["cookiefile"] = cookies_file
             
             # Extract info to see available formats
             with yt_dlp.YoutubeDL(info_opts) as ydl_info:
-                video_info = ydl_info.extract_info(url, download=False)
+                try:
+                    video_info = ydl_info.extract_info(url, download=False)
+                except yt_dlp.utils.DownloadError as probe_error:
+                    video_info = None
+                    logger.warning("Info probe failed, continuing with default fallback download: %s", str(probe_error))
                 
                 # Log available formats for debugging
                 if video_info and 'formats' in video_info:
@@ -540,7 +578,6 @@ def _download_video_to_tmp(
                     logger.info("Found %d available formats for video %s", format_count, video_info.get('id', 'unknown'))
                     
                     # Try to find a working format ID
-                    working_format_id = None
                     for fmt in video_info.get('formats', []):
                         # Look for formats with both video and audio, or just video/audio separately
                         if fmt.get('vcodec') != 'none' and fmt.get('acodec') != 'none':
@@ -567,23 +604,9 @@ def _download_video_to_tmp(
                 
                 # Now try downloading with format ID if we found one, otherwise use "worst" as last resort
                 download_opts = {
+                    **_base_ydl_opts(),
                     "outtmpl": os.path.join(temp_dir, "%(title)s.%(ext)s"),
-                    "noplaylist": True,
-                    "quiet": False,
-                    "no_warnings": True,
-                    # Keep fallback path independent from host/global yt-dlp config.
-                    "ignoreconfig": True,
                     "restrictfilenames": True,
-                    "http_headers": {
-                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                        "Accept-Language": "en-us,en;q=0.5",
-                        "Accept-Encoding": "gzip, deflate",
-                        "Referer": "https://www.youtube.com/",
-                    },
-                    "fragment_retries": 10,
-                    "retries": 10,
-                    "file_access_retries": 3,
                 }
                 
                 # Use discovered format ID; otherwise let yt-dlp pick automatically.
@@ -639,7 +662,7 @@ def _download_video_to_tmp(
                             break
                     
                     if file_path:
-                        logger.info("Success with format ID or 'worst' selector: %s", file_path)
+                        logger.info("Success with fallback format selection: %s", file_path)
                         download_success = True
                     else:
                         raise yt_dlp.utils.DownloadError("Download completed but file not found")
@@ -647,14 +670,19 @@ def _download_video_to_tmp(
             # Even the format ID approach failed
             shutil.rmtree(temp_dir, ignore_errors=True)
             error_msg = str(final_error)
-            logger.exception("yt-dlp download error (all methods failed) for url=%s", url)
+            if _is_format_unavailable_error(error_msg):
+                logger.warning("No playable format could be selected after all fallbacks for url=%s", url)
+            else:
+                logger.exception("yt-dlp download error (all methods failed) for url=%s", url)
             
             # Provide more helpful error message
-            if "Requested format is not available" in error_msg:
+            if _is_format_unavailable_error(error_msg):
                 raise HTTPException(
                     status_code=400, 
-                    detail=f"Download error: Video may be restricted (age-restricted, region-locked, or private). "
-                           f"Try providing cookies via cookies_b64 parameter. Original error: {error_msg}"
+                    detail=(
+                        "Download error: no playable format was available for this video right now. "
+                        "The video may be restricted (age/region/private) or temporarily unavailable."
+                    ),
                 )
             else:
                 raise HTTPException(status_code=400, detail=f"Download error: {error_msg}")
@@ -785,13 +813,11 @@ def _download_audio_to_tmp(
         raise HTTPException(status_code=415, detail="FFmpeg required for mp3/wav extraction.")
 
     temp_dir = tempfile.mkdtemp(prefix="ytvdl_a_")
+    url = _sanitize_youtube_url(url)
 
     ydl_opts = {
+        **_base_ydl_opts(),
         "outtmpl": os.path.join(temp_dir, "%(title)s.%(ext)s"),
-        "noplaylist": True,
-        "quiet": False,
-        "no_warnings": True,
-        "ignoreconfig": True,
         "restrictfilenames": True,
         "format": "bestaudio/best",
         "ffmpeg_location": FFMPEG_EXE,
