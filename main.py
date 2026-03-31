@@ -277,13 +277,17 @@ def _download_video_to_tmp(
         
         return opts
 
-    # Build format selectors - prefer progressive formats over HLS when possible
+    # Build format selectors - prioritize progressive formats (single file) over separate streams
     # Strategy: When FFmpeg is available, NEVER use height constraints in format selector
     # Instead, download best quality and let FFmpeg scale it down
     if ffmpeg_available:
-        # With FFmpeg: prefer separate video+audio streams, NO height constraints
+        # With FFmpeg: Try progressive formats first (most compatible), then separate streams
         # We'll scale with FFmpeg later, so get the best quality available
         primary_format = (
+            # Progressive formats (single file with audio+video) - most compatible
+            "best[acodec!=none][vcodec!=none][ext=mp4]/"
+            "best[acodec!=none][vcodec!=none]/"
+            # Separate streams (if progressive not available)
             "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/"
             "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
             "bestvideo+bestaudio[ext=m4a]/"
@@ -314,17 +318,19 @@ def _download_video_to_tmp(
     # Retry selectors (progressively simpler) - these are tried as separate attempts
     retry_selectors = []
     if ffmpeg_available:
-        # With FFmpeg, we can always scale, so use very simple selectors
+        # With FFmpeg, try progressive formats first, then anything
         retry_selectors = [
-            "bestvideo+bestaudio/best",
-            "bestvideo/best",
-            "best",
+            "best[acodec!=none][vcodec!=none]/best",  # Progressive only
+            "bestvideo+bestaudio/best",  # Separate streams
+            "best",  # Anything
+            None,  # No format selector - let yt-dlp choose (earlier fallback)
         ]
     else:
         # Without FFmpeg, need formats with both audio and video
         retry_selectors = [
             "best[acodec!=none][vcodec!=none]/best",
             "best",
+            None,  # No format selector - let yt-dlp choose (earlier fallback)
         ]
 
     # Try download with preferred format selector, fallback to simpler selector on error
@@ -427,18 +433,15 @@ def _download_video_to_tmp(
             logger.exception("Unexpected error during download for url=%s", url)
             raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
     
-    # If all format selectors failed, try one final time with absolutely minimal options
+    # If all format selectors failed, try extracting info first to see what's available
     if not download_success or info is None or prepared is None:
-        logger.warning("All format selectors failed, trying absolutely minimal yt-dlp options")
+        logger.warning("All format selectors failed, extracting info to see available formats")
         try:
-            # Use absolutely minimal options - no postprocessors, no forced formats
-            minimal_opts = {
-                "outtmpl": os.path.join(temp_dir, "%(title)s.%(ext)s"),
+            # First, extract info without downloading to see what formats are available
+            info_opts = {
                 "noplaylist": True,
                 "quiet": False,
                 "no_warnings": True,
-                "restrictfilenames": True,
-                "format": "best",  # Simplest possible format selector
                 "http_headers": {
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -446,61 +449,137 @@ def _download_video_to_tmp(
                     "Accept-Encoding": "gzip, deflate",
                     "Referer": "https://www.youtube.com/",
                 },
-                "fragment_retries": 10,
-                "retries": 10,
-                "file_access_retries": 3,
             }
-            # Don't set merge_output_format or postprocessors - let yt-dlp handle format naturally
             if cookies_file:
-                minimal_opts["cookiefile"] = cookies_file
-            if progress_id:
-                minimal_opts["progress_hooks"] = [_make_progress_hook(progress_id)]
-            # Only set ffmpeg location if available, but don't force postprocessing
-            if ffmpeg_available and _has_ffmpeg():
-                minimal_opts["ffmpeg_location"] = FFMPEG_EXE
+                info_opts["cookiefile"] = cookies_file
             
-            with yt_dlp.YoutubeDL(minimal_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                prepared = ydl.prepare_filename(info)
+            # Extract info to see available formats
+            with yt_dlp.YoutubeDL(info_opts) as ydl_info:
+                video_info = ydl_info.extract_info(url, download=False)
                 
-                # Find the downloaded file
-                base, _ = os.path.splitext(prepared)
-                candidates = [
-                    prepared,
-                    base + ".mp4",
-                    base + ".mkv",
-                    base + ".webm",
-                ]
+                # Log available formats for debugging
+                if video_info and 'formats' in video_info:
+                    format_count = len(video_info['formats'])
+                    logger.info("Found %d available formats for video %s", format_count, video_info.get('id', 'unknown'))
+                    
+                    # Try to find a working format ID
+                    working_format_id = None
+                    for fmt in video_info.get('formats', []):
+                        # Look for formats with both video and audio, or just video/audio separately
+                        if fmt.get('vcodec') != 'none' and fmt.get('acodec') != 'none':
+                            # Progressive format (has both)
+                            working_format_id = fmt.get('format_id')
+                            logger.info("Found progressive format: %s", working_format_id)
+                            break
+                    
+                    # If no progressive format, try to get best video and best audio separately
+                    if not working_format_id and ffmpeg_available:
+                        best_video_id = None
+                        best_audio_id = None
+                        for fmt in video_info.get('formats', []):
+                            if fmt.get('vcodec') != 'none' and fmt.get('acodec') == 'none':
+                                if not best_video_id:
+                                    best_video_id = fmt.get('format_id')
+                            elif fmt.get('acodec') != 'none' and fmt.get('vcodec') == 'none':
+                                if not best_audio_id:
+                                    best_audio_id = fmt.get('format_id')
+                        
+                        if best_video_id and best_audio_id:
+                            working_format_id = f"{best_video_id}+{best_audio_id}"
+                            logger.info("Found separate streams: video=%s, audio=%s", best_video_id, best_audio_id)
                 
-                # Check info for actual filepath
-                if info and 'requested_downloads' in info:
-                    for dl_info in info.get('requested_downloads', []):
-                        if 'filepath' in dl_info:
-                            candidates.insert(0, dl_info['filepath'])
+                # Now try downloading with format ID if we found one, otherwise use "worst" as last resort
+                download_opts = {
+                    "outtmpl": os.path.join(temp_dir, "%(title)s.%(ext)s"),
+                    "noplaylist": True,
+                    "quiet": False,
+                    "no_warnings": True,
+                    "restrictfilenames": True,
+                    "http_headers": {
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                        "Accept-Language": "en-us,en;q=0.5",
+                        "Accept-Encoding": "gzip, deflate",
+                        "Referer": "https://www.youtube.com/",
+                    },
+                    "fragment_retries": 10,
+                    "retries": 10,
+                    "file_access_retries": 3,
+                }
                 
-                # Scan temp_dir for any video/audio files
-                for entry in os.scandir(temp_dir):
-                    if entry.is_file():
-                        ext = os.path.splitext(entry.name)[1].lower()
-                        if ext in ['.mp4', '.mkv', '.webm', '.m4a', '.mp3']:
-                            candidates.append(entry.path)
-                
-                file_path = None
-                for candidate in candidates:
-                    if os.path.exists(candidate) and os.path.getsize(candidate) > 0:
-                        file_path = candidate
-                        break
-                
-                if file_path:
-                    logger.info("Success with minimal format selector 'best': %s", file_path)
-                    download_success = True
+                # Use format ID if we found one, otherwise try "worst" (lowest quality, most compatible)
+                if working_format_id:
+                    download_opts["format"] = working_format_id
+                    logger.info("Trying download with format ID: %s", working_format_id)
                 else:
-                    raise yt_dlp.utils.DownloadError("Download completed but file not found")
+                    download_opts["format"] = "worst"  # Try worst quality as last resort
+                    logger.info("Trying download with 'worst' format selector")
+                
+                if cookies_file:
+                    download_opts["cookiefile"] = cookies_file
+                if progress_id:
+                    download_opts["progress_hooks"] = [_make_progress_hook(progress_id)]
+                if ffmpeg_available and _has_ffmpeg():
+                    download_opts["ffmpeg_location"] = FFMPEG_EXE
+                    # Only add postprocessors if we're using separate streams
+                    if working_format_id and '+' in working_format_id:
+                        download_opts["merge_output_format"] = "mp4"
+                        download_opts["postprocessors"] = [
+                            {"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"},
+                        ]
+                
+                with yt_dlp.YoutubeDL(download_opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                    prepared = ydl.prepare_filename(info)
+                    
+                    # Find the downloaded file
+                    base, _ = os.path.splitext(prepared)
+                    candidates = [
+                        prepared,
+                        base + ".mp4",
+                        base + ".mkv",
+                        base + ".webm",
+                    ]
+                    
+                    # Check info for actual filepath
+                    if info and 'requested_downloads' in info:
+                        for dl_info in info.get('requested_downloads', []):
+                            if 'filepath' in dl_info:
+                                candidates.insert(0, dl_info['filepath'])
+                    
+                    # Scan temp_dir for any video/audio files
+                    for entry in os.scandir(temp_dir):
+                        if entry.is_file():
+                            ext = os.path.splitext(entry.name)[1].lower()
+                            if ext in ['.mp4', '.mkv', '.webm', '.m4a', '.mp3']:
+                                candidates.append(entry.path)
+                    
+                    file_path = None
+                    for candidate in candidates:
+                        if os.path.exists(candidate) and os.path.getsize(candidate) > 0:
+                            file_path = candidate
+                            break
+                    
+                    if file_path:
+                        logger.info("Success with format ID or 'worst' selector: %s", file_path)
+                        download_success = True
+                    else:
+                        raise yt_dlp.utils.DownloadError("Download completed but file not found")
         except Exception as final_error:
-            # Even the minimal approach failed
+            # Even the format ID approach failed
             shutil.rmtree(temp_dir, ignore_errors=True)
-            logger.exception("yt-dlp download error (all format selectors including minimal failed) for url=%s", url)
-            raise HTTPException(status_code=400, detail=f"Download error: Unable to find compatible format. Last error: {str(final_error)}")
+            error_msg = str(final_error)
+            logger.exception("yt-dlp download error (all methods failed) for url=%s", url)
+            
+            # Provide more helpful error message
+            if "Requested format is not available" in error_msg:
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"Download error: Video may be restricted (age-restricted, region-locked, or private). "
+                           f"Try providing cookies via cookies_b64 parameter. Original error: {error_msg}"
+                )
+            else:
+                raise HTTPException(status_code=400, detail=f"Download error: {error_msg}")
     
     if not download_success or info is None or prepared is None or file_path is None:
         shutil.rmtree(temp_dir, ignore_errors=True)
