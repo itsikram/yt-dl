@@ -221,12 +221,24 @@ def _base_ydl_opts() -> dict:
         "file_access_retries": 3,
         "external_downloader": None,
         "external_downloader_args": None,
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["android", "web", "tv"],
-            }
-        },
+        "extractor_retries": 3,
     }
+
+
+def _youtube_client_profiles() -> list[list[str]]:
+    # Try multiple YouTube API client combinations; some videos only expose formats on specific clients.
+    return [
+        ["android", "web", "tv"],
+        ["ios", "android", "web"],
+        ["tv_embedded", "tv", "web"],
+        ["android", "tv_embedded", "web"],
+    ]
+
+
+def _with_youtube_clients(opts: dict, clients: list[str]) -> dict:
+    out = dict(opts)
+    out["extractor_args"] = {"youtube": {"player_client": clients}}
+    return out
 
 
 def _make_progress_hook(progress_id: str):
@@ -362,13 +374,13 @@ def _download_video_to_tmp(
 
     ffmpeg_available = _has_ffmpeg()
 
-    def _build_ydl_opts(format_selector: str | None) -> dict:
+    def _build_ydl_opts(format_selector: str | None, clients: list[str]) -> dict:
         """Build yt-dlp options with the given format selector. If None, uses yt-dlp default."""
-        opts = {
+        opts = _with_youtube_clients({
             **_base_ydl_opts(),
             "outtmpl": os.path.join(temp_dir, "%(title)s.%(ext)s"),
             "restrictfilenames": True,
-        }
+        }, clients)
         
         # Only add format parameter if specified (None means use yt-dlp default)
         if format_selector is not None:
@@ -463,94 +475,98 @@ def _download_video_to_tmp(
     download_success = False
     
     all_selectors = [primary_format] + retry_selectors
+    client_profiles = _youtube_client_profiles()
     
-    for attempt, format_selector in enumerate(all_selectors):
+    total_attempts = len(client_profiles) * len(all_selectors)
+    global_attempt = 0
+    for clients in client_profiles:
+        for attempt, format_selector in enumerate(all_selectors):
+            global_attempt += 1
+            if download_success:
+                break
+            try:
+                ydl_opts = _build_ydl_opts(format_selector, clients)
+                selector_str = format_selector if format_selector else "(yt-dlp default)"
+                logger.info(
+                    "Attempt %d/%d: client=%s selector='%s' url=%s",
+                    global_attempt,
+                    total_attempts,
+                    ",".join(clients),
+                    selector_str,
+                    url,
+                )
+
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                    prepared = ydl.prepare_filename(info)
+
+                    # After download, the actual file might have a different name due to post-processing
+                    # Check multiple possible locations and extensions
+                    base, _ = os.path.splitext(prepared)
+                    candidates = [
+                        prepared,
+                        base + ".mp4",
+                        base + ".mkv",
+                        base + ".webm",
+                    ]
+
+                    # Also check if info has the actual filepath after post-processing
+                    if info and 'requested_downloads' in info:
+                        for dl_info in info.get('requested_downloads', []):
+                            if 'filepath' in dl_info:
+                                candidates.insert(0, dl_info['filepath'])
+
+                    # Also scan temp_dir for video files (in case filename doesn't match expected pattern)
+                    if not any(os.path.exists(c) for c in candidates):
+                        try:
+                            for entry in os.scandir(temp_dir):
+                                if entry.is_file():
+                                    ext = os.path.splitext(entry.name)[1].lower()
+                                    if ext in ['.mp4', '.mkv', '.webm']:
+                                        candidates.append(entry.path)
+                        except Exception:
+                            pass
+
+                    file_path = None
+                    for candidate in candidates:
+                        if os.path.exists(candidate) and os.path.getsize(candidate) > 0:
+                            file_path = candidate
+                            break
+
+                    if file_path:
+                        # Success! File exists and has content
+                        logger.info("Found downloaded file: %s (size: %d bytes)", file_path, os.path.getsize(file_path))
+                        download_success = True
+                        break
+                    else:
+                        # File is empty or missing - this is the error we're trying to fix
+                        logger.warning("Download completed but file is empty or missing, trying next format selector")
+                        file_path = None  # Reset for next attempt
+                        raise yt_dlp.utils.DownloadError("The downloaded file is empty")
+
+            except yt_dlp.utils.DownloadError as download_error:
+                error_str = str(download_error)
+                last_error = download_error
+
+                # Check if it's a format availability error or empty file error
+                is_format_error = _is_format_unavailable_error(error_str)
+                is_empty_error = "downloaded file is empty" in error_str.lower()
+
+                if is_format_error or is_empty_error:
+                    logger.info("Attempt failed with format/empty error; rotating selector/client")
+                    continue
+                else:
+                    # Other error - don't retry
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                    logger.exception("yt-dlp download error for url=%s", url)
+                    raise HTTPException(status_code=400, detail=f"Download error: {str(download_error)}")
+            except Exception as e:
+                # Unexpected error
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                logger.exception("Unexpected error during download for url=%s", url)
+                raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
         if download_success:
             break
-        try:
-            ydl_opts = _build_ydl_opts(format_selector)
-            selector_str = format_selector if format_selector else "(yt-dlp default)"
-            logger.info("Attempt %d/%d: Trying format selector '%s' for url=%s", attempt + 1, len(all_selectors), selector_str, url)
-            
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                prepared = ydl.prepare_filename(info)
-                
-                # After download, the actual file might have a different name due to post-processing
-                # Check multiple possible locations and extensions
-                base, _ = os.path.splitext(prepared)
-                candidates = [
-                    prepared,
-                    base + ".mp4",
-                    base + ".mkv",
-                    base + ".webm",
-                ]
-                
-                # Also check if info has the actual filepath after post-processing
-                if info and 'requested_downloads' in info:
-                    for dl_info in info.get('requested_downloads', []):
-                        if 'filepath' in dl_info:
-                            candidates.insert(0, dl_info['filepath'])
-                
-                # Also scan temp_dir for video files (in case filename doesn't match expected pattern)
-                if not any(os.path.exists(c) for c in candidates):
-                    try:
-                        for entry in os.scandir(temp_dir):
-                            if entry.is_file():
-                                ext = os.path.splitext(entry.name)[1].lower()
-                                if ext in ['.mp4', '.mkv', '.webm']:
-                                    candidates.append(entry.path)
-                    except Exception:
-                        pass
-                
-                file_path = None
-                for candidate in candidates:
-                    if os.path.exists(candidate) and os.path.getsize(candidate) > 0:
-                        file_path = candidate
-                        break
-                
-                if file_path:
-                    # Success! File exists and has content
-                    logger.info("Found downloaded file: %s (size: %d bytes)", file_path, os.path.getsize(file_path))
-                    download_success = True
-                    break
-                else:
-                    # File is empty or missing - this is the error we're trying to fix
-                    logger.warning("Download completed but file is empty or missing, trying next format selector")
-                    file_path = None  # Reset for next attempt
-                    # Continue to next selector
-                    if attempt < len(all_selectors) - 1:
-                        continue
-                    else:
-                        raise yt_dlp.utils.DownloadError("The downloaded file is empty")
-                        
-        except yt_dlp.utils.DownloadError as download_error:
-            error_str = str(download_error)
-            last_error = download_error
-            
-            # Check if it's a format availability error or empty file error
-            is_format_error = _is_format_unavailable_error(error_str)
-            is_empty_error = "downloaded file is empty" in error_str.lower()
-            
-            if is_format_error or is_empty_error:
-                # Try next selector
-                if attempt < len(all_selectors) - 1:
-                    logger.info("Format unavailable on attempt %d; trying next selector", attempt + 1)
-                    continue
-                else:
-                    # Last attempt failed - will try default format after loop
-                    logger.warning("All format selectors failed, will try yt-dlp default format selection")
-                    continue
-            else:
-                # Other error - don't retry
-                shutil.rmtree(temp_dir, ignore_errors=True)
-                logger.exception("yt-dlp download error for url=%s", url)
-                raise HTTPException(status_code=400, detail=f"Download error: {str(download_error)}")
-        except Exception as e:
-            # Unexpected error
-            shutil.rmtree(temp_dir, ignore_errors=True)
-            logger.exception("Unexpected error during download for url=%s", url)
-            raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
     
     # If all format selectors failed, try extracting info first to see what's available
     if not download_success or info is None or prepared is None:
@@ -564,43 +580,56 @@ def _download_video_to_tmp(
             if cookies_file:
                 info_opts["cookiefile"] = cookies_file
             
-            # Extract info to see available formats
-            with yt_dlp.YoutubeDL(info_opts) as ydl_info:
-                try:
-                    video_info = ydl_info.extract_info(url, download=False)
-                except yt_dlp.utils.DownloadError as probe_error:
-                    video_info = None
-                    logger.warning("Info probe failed, continuing with default fallback download: %s", str(probe_error))
+            for clients in client_profiles:
+                info_opts_for_client = _with_youtube_clients(info_opts, clients)
+                # Extract info to see available formats
+                with yt_dlp.YoutubeDL(info_opts_for_client) as ydl_info:
+                    try:
+                        video_info = ydl_info.extract_info(url, download=False)
+                    except yt_dlp.utils.DownloadError as probe_error:
+                        video_info = None
+                        logger.warning(
+                            "Info probe failed for client=%s, continuing: %s",
+                            ",".join(clients),
+                            str(probe_error),
+                        )
                 
-                # Log available formats for debugging
-                if video_info and 'formats' in video_info:
-                    format_count = len(video_info['formats'])
-                    logger.info("Found %d available formats for video %s", format_count, video_info.get('id', 'unknown'))
+                    # Log available formats for debugging
+                    if video_info and 'formats' in video_info:
+                        format_count = len(video_info['formats'])
+                        logger.info(
+                            "Found %d available formats for video %s with client=%s",
+                            format_count,
+                            video_info.get('id', 'unknown'),
+                            ",".join(clients),
+                        )
                     
-                    # Try to find a working format ID
-                    for fmt in video_info.get('formats', []):
-                        # Look for formats with both video and audio, or just video/audio separately
-                        if fmt.get('vcodec') != 'none' and fmt.get('acodec') != 'none':
-                            # Progressive format (has both)
-                            working_format_id = fmt.get('format_id')
-                            logger.info("Found progressive format: %s", working_format_id)
-                            break
-                    
-                    # If no progressive format, try to get best video and best audio separately
-                    if not working_format_id and ffmpeg_available:
-                        best_video_id = None
-                        best_audio_id = None
+                        # Try to find a working format ID
                         for fmt in video_info.get('formats', []):
-                            if fmt.get('vcodec') != 'none' and fmt.get('acodec') == 'none':
-                                if not best_video_id:
-                                    best_video_id = fmt.get('format_id')
-                            elif fmt.get('acodec') != 'none' and fmt.get('vcodec') == 'none':
-                                if not best_audio_id:
-                                    best_audio_id = fmt.get('format_id')
-                        
-                        if best_video_id and best_audio_id:
-                            working_format_id = f"{best_video_id}+{best_audio_id}"
-                            logger.info("Found separate streams: video=%s, audio=%s", best_video_id, best_audio_id)
+                            # Look for formats with both video and audio, or just video/audio separately
+                            if fmt.get('vcodec') != 'none' and fmt.get('acodec') != 'none':
+                                # Progressive format (has both)
+                                working_format_id = fmt.get('format_id')
+                                logger.info("Found progressive format: %s", working_format_id)
+                                break
+                    
+                        # If no progressive format, try to get best video and best audio separately
+                        if not working_format_id and ffmpeg_available:
+                            best_video_id = None
+                            best_audio_id = None
+                            for fmt in video_info.get('formats', []):
+                                if fmt.get('vcodec') != 'none' and fmt.get('acodec') == 'none':
+                                    if not best_video_id:
+                                        best_video_id = fmt.get('format_id')
+                                elif fmt.get('acodec') != 'none' and fmt.get('vcodec') == 'none':
+                                    if not best_audio_id:
+                                        best_audio_id = fmt.get('format_id')
+                            
+                            if best_video_id and best_audio_id:
+                                working_format_id = f"{best_video_id}+{best_audio_id}"
+                                logger.info("Found separate streams: video=%s, audio=%s", best_video_id, best_audio_id)
+                    if working_format_id:
+                        break
                 
                 # Now try downloading with format ID if we found one, otherwise use "worst" as last resort
                 download_opts = {
@@ -629,6 +658,15 @@ def _download_video_to_tmp(
                             {"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"},
                         ]
                 
+                fallback_clients = client_profiles[0]
+                if working_format_id:
+                    # Prefer the profile that discovered the working format if available.
+                    for candidates in client_profiles:
+                        if candidates == clients:
+                            fallback_clients = candidates
+                            break
+                download_opts = _with_youtube_clients(download_opts, fallback_clients)
+
                 with yt_dlp.YoutubeDL(download_opts) as ydl:
                     info = ydl.extract_info(url, download=True)
                     prepared = ydl.prepare_filename(info)
