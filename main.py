@@ -237,8 +237,27 @@ def _youtube_client_profiles() -> list[list[str]]:
 
 def _with_youtube_clients(opts: dict, clients: list[str]) -> dict:
     out = dict(opts)
-    out["extractor_args"] = {"youtube": {"player_client": clients}}
+    out["extractor_args"] = {
+        "youtube": {
+            "player_client": ",".join(clients),
+            "include_dash_manifest": "true",
+            "include_hls_manifest": "true",
+        }
+    }
     return out
+
+
+def _minimal_ydl_opts() -> dict:
+    # Last-resort defaults: keep this minimal to avoid over-constraining extractor behavior.
+    return {
+        "noplaylist": True,
+        "quiet": False,
+        "no_warnings": True,
+        "ignoreconfig": True,
+        "fragment_retries": 10,
+        "retries": 10,
+        "file_access_retries": 3,
+    }
 
 
 def _make_progress_hook(progress_id: str):
@@ -706,24 +725,69 @@ def _download_video_to_tmp(
                         raise yt_dlp.utils.DownloadError("Download completed but file not found")
         except Exception as final_error:
             # Even the format ID approach failed
-            shutil.rmtree(temp_dir, ignore_errors=True)
             error_msg = str(final_error)
-            if _is_format_unavailable_error(error_msg):
-                logger.warning("No playable format could be selected after all fallbacks for url=%s", url)
-            else:
-                logger.exception("yt-dlp download error (all methods failed) for url=%s", url)
+            logger.warning("Fallback with client profiles failed: %s", error_msg)
+
+            # Absolute last resort: vanilla yt-dlp defaults without extractor_args/client overrides.
+            # This helps when specific extractor args are incompatible with the deployed yt-dlp build.
+            try:
+                logger.warning("Trying final minimal yt-dlp fallback for url=%s", url)
+                final_opts = {
+                    **_minimal_ydl_opts(),
+                    "outtmpl": os.path.join(temp_dir, "%(title)s.%(ext)s"),
+                    "restrictfilenames": True,
+                    "http_headers": _base_ydl_http_headers(),
+                }
+                if cookies_file:
+                    final_opts["cookiefile"] = cookies_file
+                if progress_id:
+                    final_opts["progress_hooks"] = [_make_progress_hook(progress_id)]
+                else:
+                    final_opts["progress_hooks"] = [_progress_printer]
+                if ffmpeg_available and _has_ffmpeg():
+                    final_opts["ffmpeg_location"] = FFMPEG_EXE
+
+                with yt_dlp.YoutubeDL(final_opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                    prepared = ydl.prepare_filename(info)
+
+                base, _ = os.path.splitext(prepared)
+                candidates = [prepared, base + ".mp4", base + ".mkv", base + ".webm"]
+                if info and "requested_downloads" in info:
+                    for dl_info in info.get("requested_downloads", []):
+                        if "filepath" in dl_info:
+                            candidates.insert(0, dl_info["filepath"])
+                for entry in os.scandir(temp_dir):
+                    if entry.is_file():
+                        ext = os.path.splitext(entry.name)[1].lower()
+                        if ext in [".mp4", ".mkv", ".webm", ".m4a", ".mp3"]:
+                            candidates.append(entry.path)
+                file_path = next((p for p in candidates if os.path.exists(p) and os.path.getsize(p) > 0), None)
+                if file_path:
+                    logger.info("Final minimal fallback succeeded: %s", file_path)
+                    download_success = True
+                else:
+                    raise yt_dlp.utils.DownloadError("Minimal fallback finished but file not found")
+            except Exception as minimal_error:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                minimal_msg = str(minimal_error)
+                if _is_format_unavailable_error(minimal_msg):
+                    logger.warning("No playable format could be selected after all fallbacks for url=%s", url)
+                else:
+                    logger.exception("yt-dlp download error (all methods failed) for url=%s", url)
             
             # Provide more helpful error message
-            if _is_format_unavailable_error(error_msg):
-                raise HTTPException(
-                    status_code=400, 
-                    detail=(
-                        "Download error: no playable format was available for this video right now. "
-                        "The video may be restricted (age/region/private) or temporarily unavailable."
-                    ),
-                )
-            else:
-                raise HTTPException(status_code=400, detail=f"Download error: {error_msg}")
+                if _is_format_unavailable_error(minimal_msg):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "Download error: no playable format was available for this video right now. "
+                            "The video may require account cookies (age/region/private), or YouTube is blocking "
+                            "anonymous extraction for this item."
+                        ),
+                    )
+                else:
+                    raise HTTPException(status_code=400, detail=f"Download error: {minimal_msg}")
     
     if not download_success or info is None or prepared is None or file_path is None:
         shutil.rmtree(temp_dir, ignore_errors=True)
