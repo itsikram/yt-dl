@@ -434,9 +434,20 @@ def _download_video_to_tmp(
     # Strategy: When FFmpeg is available, NEVER use height constraints in format selector
     # Instead, download best quality and let FFmpeg scale it down
     if ffmpeg_available:
-        # With FFmpeg: Try progressive formats first (most compatible), then separate streams
-        # We'll scale with FFmpeg later, so get the best quality available
-        primary_format = (
+        # With FFmpeg: Try progressive formats first (most compatible), then separate streams.
+        # When a height is requested, first try streams at or below it, so fast mode (no
+        # transcode) still returns the requested size instead of downloading full quality.
+        height_capped = ""
+        if target_height:
+            h = int(target_height)
+            height_capped = (
+                f"bestvideo[ext=mp4][vcodec^=avc1][height<={h}]+bestaudio[ext=m4a]/"
+                f"best[acodec!=none][vcodec!=none][ext=mp4][height<={h}]/"
+                f"bestvideo[ext=mp4][height<={h}]+bestaudio[ext=m4a]/"
+                f"bestvideo[height<={h}]+bestaudio/"
+                f"best[acodec!=none][vcodec!=none][height<={h}]/"
+            )
+        primary_format = height_capped + (
             # Progressive formats (single file with audio+video) - most compatible
             "best[acodec!=none][vcodec!=none][ext=mp4]/"
             "best[acodec!=none][vcodec!=none]/"

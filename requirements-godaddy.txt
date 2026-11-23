@@ -1,0 +1,4 @@
+fastapi>=0.110
+a2wsgi>=1.10
+yt-dlp
+imageio-ffmpeg>=0.4.9
